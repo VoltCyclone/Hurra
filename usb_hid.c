@@ -23,6 +23,8 @@
 uint16_t attached_vid = 0;
 uint16_t attached_pid = 0;
 bool attached_has_serial = false;
+static volatile bool pending_device_reenumeration = false;
+static bool checked_runtime_mouse_override = false;
 
 // Dynamic string descriptor storage
 static char attached_manufacturer[64] = "";
@@ -130,6 +132,11 @@ void force_usb_reenumeration() {
     }
 }
 
+static inline void request_device_reenumeration(void) {
+    __dmb();
+    pending_device_reenumeration = true;
+}
+
 //--------------------------------------------------------------------+
 // USB Descriptor Cloning Infrastructure
 //--------------------------------------------------------------------+
@@ -211,9 +218,10 @@ static uint8_t mouse_device_instance = 0;
 // Vendor report passthrough queue (Core1 producer → Core0 consumer).
 // When the host mouse sends vendor reports (e.g. Logitech HID++, Razer),
 // Core1 queues them here and Core0 drains them via tud_hid_report().
-#define VENDOR_QUEUE_SIZE 8
+#define VENDOR_QUEUE_SIZE 16
 #define VENDOR_QUEUE_MASK (VENDOR_QUEUE_SIZE - 1)
 #define VENDOR_REPORT_MAX_LEN 64
+#define PASSTHROUGH_GET_TIMEOUT_US 80000u
 
 typedef struct {
     uint8_t device_instance;  // Which device-side HID instance to send on
@@ -270,12 +278,29 @@ static uint8_t max_string_index_seen = 3;  // Track highest string index from ho
 
 typedef struct {
     uint8_t report_id;
+    uint8_t report_type;
     uint8_t data[VENDOR_REPORT_MAX_LEN];
     uint8_t len;
     bool    valid;
 } cached_report_t;
 
 static cached_report_t report_cache[MAX_DEVICE_HID_INTERFACES][REPORT_CACHE_SLOTS_PER_ITF];
+
+typedef struct {
+    volatile bool pending;
+    volatile bool busy;
+    volatile bool done;
+    uint8_t host_dev_addr;
+    uint8_t host_instance;
+    uint8_t report_id;
+    uint8_t report_type;
+    uint16_t request_len;
+    volatile uint16_t actual_len;
+    uint8_t data[VENDOR_REPORT_MAX_LEN];
+} get_report_bridge_t;
+
+static get_report_bridge_t get_report_bridge;
+
 
 // Function to fetch string descriptors from attached device
 static void fetch_device_string_descriptors(uint8_t dev_addr) {
@@ -660,6 +685,7 @@ static void reset_device_string_descriptors(void) {
     vendor_fwd_queue.head = vendor_fwd_queue.tail = 0;
     set_report_queue.head = set_report_queue.tail = 0;
     memset(report_cache, 0, sizeof(report_cache));
+    memset(&get_report_bridge, 0, sizeof(get_report_bridge));
 
     // Reset extra string descriptor cache
     extra_string_count = 0;
@@ -1397,6 +1423,7 @@ bool usb_hid_init(void)
     vendor_fwd_queue.head = vendor_fwd_queue.tail = 0;
     set_report_queue.head = set_report_queue.tail = 0;
     memset(report_cache, 0, sizeof(report_cache));
+    memset(&get_report_bridge, 0, sizeof(get_report_bridge));
     extra_string_count = 0;
 
     // Seed output-stage PRNG from hardware TRNG
@@ -1855,6 +1882,13 @@ void hid_device_task(void)
     // Xbox mode: skip HID device task entirely, xbox_device_task handles it
     if (g_xbox_mode) return;
 
+    if (pending_device_reenumeration) {
+        pending_device_reenumeration = false;
+        __dmb();
+        force_usb_reenumeration();
+        return;
+    }
+
     // Use cheap microsecond timer for polling with optional jitter.
     // Real mice have crystal/scheduling jitter; perfectly regular 1ms is detectable.
     static uint32_t start_us = 0;
@@ -2035,7 +2069,12 @@ check_idle:
     if (was_active && tud_hid_n_ready(mouse_device_instance))
     {
         uint8_t current_buttons = kmbox_get_current_buttons();
-        if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
+        if (using_16bit_output_override) {
+            uint8_t raw[16];
+            build_raw_mouse_report(raw, sizeof(raw), &output_mouse_layout_16bit,
+                                   current_buttons, 0, 0, 0, 0);
+            tud_hid_n_report(mouse_device_instance, REPORT_ID_MOUSE, raw, output_mouse_layout_16bit.report_size);
+        } else if (host_mouse_layout.valid && host_mouse_desc_len > 0) {
             uint8_t raw[64];
             uint8_t sz = host_mouse_layout.report_size;
             if (sz > sizeof(raw)) sz = sizeof(raw);
@@ -2175,6 +2214,25 @@ void hid_host_task(void)
         __dmb();
         set_report_queue.tail = (set_report_queue.tail + 1) & VENDOR_QUEUE_MASK;
     }
+
+    if (get_report_bridge.pending && !get_report_bridge.busy) {
+        get_report_bridge.pending = false;
+        get_report_bridge.done = false;
+        get_report_bridge.actual_len = 0;
+        get_report_bridge.busy = true;
+        __dmb();
+
+        bool started = tuh_hid_get_report(get_report_bridge.host_dev_addr,
+                                          get_report_bridge.host_instance,
+                                          get_report_bridge.report_id,
+                                          get_report_bridge.report_type,
+                                          get_report_bridge.data,
+                                          get_report_bridge.request_len);
+        if (!started) {
+            get_report_bridge.busy = false;
+            get_report_bridge.done = true;
+        }
+    }
 }
 
 // Device callbacks with improved error handling
@@ -2255,6 +2313,9 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, const uint8_t *desc_re
         mounted_hid_itf_count = 0;
         mirrored_itf_count = 0;
         mouse_device_instance = 0;
+        checked_runtime_mouse_override = false;
+        pending_device_reenumeration = false;
+        memset(&get_report_bridge, 0, sizeof(get_report_bridge));
         memset(mirrored_itfs, 0, sizeof(mirrored_itfs));
 
         // Fetch string descriptors from the attached device
@@ -2468,9 +2529,8 @@ static void __not_in_flash_func(parse_and_forward_mouse_report)(const uint8_t *d
     // --- RUNTIME DETECTION: 16-bit mouse with wrong descriptor ---
     // macOS/Windows may expose an 8-bit descriptor for 16-bit mice (G703, etc.)
     // Detect by comparing actual report size vs descriptor-claimed size
-    static bool checked_override = false;
-    if (!checked_override && host_mouse_layout.valid && data_len >= 8) {
-        checked_override = true;
+    if (!checked_runtime_mouse_override && host_mouse_layout.valid && data_len >= 8) {
+        checked_runtime_mouse_override = true;
         if (host_mouse_layout.x_bits == 8 && host_mouse_layout.y_bits == 8) {
             // Descriptor says 8-bit but we're receiving 8+ byte reports
             // Force 16-bit override
@@ -2483,6 +2543,7 @@ static void __not_in_flash_func(parse_and_forward_mouse_report)(const uint8_t *d
             // Rebuild descriptors with 16-bit override
             build_runtime_hid_report_with_mouse(host_mouse_desc, host_mouse_desc_len);
             rebuild_configuration_descriptor();
+            request_device_reenumeration();
         }
     }
 
@@ -2546,6 +2607,9 @@ static void __not_in_flash_func(parse_and_forward_mouse_report)(const uint8_t *d
     process_mouse_report(&mouse_report_local);
 }
 
+static void cache_report(uint8_t device_instance, uint8_t report_id, uint8_t report_type,
+                         const uint8_t *data, uint8_t data_len);
+
 // Queue a vendor/non-mouse report for Core0 to send on the device side.
 // Called from Core1 — must not call any tud_* functions.
 static void __not_in_flash_func(queue_vendor_report)(uint8_t device_instance, uint8_t report_id,
@@ -2554,21 +2618,7 @@ static void __not_in_flash_func(queue_vendor_report)(uint8_t device_instance, ui
     uint8_t capped_len = (data_len > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : data_len;
 
     // Update GET_REPORT cache so tud_hid_get_report_cb can respond to macOS IOKit.
-    if (device_instance < MAX_DEVICE_HID_INTERFACES) {
-        cached_report_t *slots = report_cache[device_instance];
-        int slot = -1;
-        int empty = -1;
-        for (int i = 0; i < REPORT_CACHE_SLOTS_PER_ITF; i++) {
-            if (slots[i].valid && slots[i].report_id == report_id) { slot = i; break; }
-            if (!slots[i].valid && empty < 0) empty = i;
-        }
-        if (slot < 0) slot = (empty >= 0) ? empty : 0;  // Evict first slot if full
-        slots[slot].report_id = report_id;
-        slots[slot].len = capped_len;
-        memcpy(slots[slot].data, data, capped_len);
-        __dmb();
-        slots[slot].valid = true;
-    }
+    cache_report(device_instance, report_id, HID_REPORT_TYPE_INPUT, data, capped_len);
 
     // Queue for Core0 to forward via interrupt IN endpoint
     uint8_t next_head = (vendor_fwd_queue.head + 1) & VENDOR_QUEUE_MASK;
@@ -2599,6 +2649,31 @@ static mirrored_interface_t* find_mirrored_interface(uint8_t dev_addr, uint8_t i
 // Get the device-side instance index for a mirrored interface.
 static uint8_t mirrored_device_instance(const mirrored_interface_t *mitf) {
     return (uint8_t)(mitf - mirrored_itfs);
+}
+
+static void cache_report(uint8_t device_instance, uint8_t report_id, uint8_t report_type,
+                         const uint8_t *data, uint8_t data_len)
+{
+    if (device_instance >= MAX_DEVICE_HID_INTERFACES || data == NULL) return;
+
+    uint8_t capped_len = (data_len > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : data_len;
+    cached_report_t *slots = report_cache[device_instance];
+    int slot = -1;
+    int empty = -1;
+    for (int i = 0; i < REPORT_CACHE_SLOTS_PER_ITF; i++) {
+        if (slots[i].valid && slots[i].report_id == report_id && slots[i].report_type == report_type) {
+            slot = i;
+            break;
+        }
+        if (!slots[i].valid && empty < 0) empty = i;
+    }
+    if (slot < 0) slot = (empty >= 0) ? empty : 0;
+    slots[slot].report_id = report_id;
+    slots[slot].report_type = report_type;
+    slots[slot].len = capped_len;
+    memcpy(slots[slot].data, data, capped_len);
+    __dmb();
+    slots[slot].valid = true;
 }
 
 void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t instance, const uint8_t *report, uint16_t len)
@@ -2699,18 +2774,91 @@ void __not_in_flash_func(tuh_hid_report_received_cb)(uint8_t dev_addr, uint8_t i
     tuh_hid_receive_report(dev_addr, instance);
 }
 
+void tuh_hid_get_report_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t report_id, uint8_t report_type, uint16_t len)
+{
+    if (get_report_bridge.busy &&
+        get_report_bridge.host_dev_addr == dev_addr &&
+        get_report_bridge.host_instance == instance &&
+        get_report_bridge.report_id == report_id &&
+        get_report_bridge.report_type == report_type) {
+        get_report_bridge.actual_len = len;
+        __dmb();
+        get_report_bridge.busy = false;
+        get_report_bridge.done = true;
+        return;
+    }
+
+}
+
+void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t report_id, uint8_t report_type, uint16_t len)
+{
+    (void)dev_addr;
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)len;
+}
+
 // HID device callbacks with improved validation
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
 {
-    (void)report_type;
-
     if (instance >= MAX_DEVICE_HID_INTERFACES || !buffer || reqlen == 0) return 0;
+
+    // Real passthrough for vendor/feature/input GET_REPORT. Logitech G Hub,
+    // Razer Synapse, etc. use this for identity, battery, DPI and profile
+    // handshakes; cached zeros make Windows software reject the device.
+    if (instance < mirrored_itf_count && mirrored_itfs[instance].active &&
+        !get_report_bridge.pending && !get_report_bridge.busy) {
+        mirrored_interface_t *mitf = &mirrored_itfs[instance];
+
+        uint16_t request_len = reqlen;
+        if (report_id != 0 && request_len < VENDOR_REPORT_MAX_LEN) {
+            request_len++;
+        }
+        if (request_len > VENDOR_REPORT_MAX_LEN) request_len = VENDOR_REPORT_MAX_LEN;
+
+        get_report_bridge.host_dev_addr = mitf->host_dev_addr;
+        get_report_bridge.host_instance = mitf->host_instance;
+        get_report_bridge.report_id = report_id;
+        get_report_bridge.report_type = (uint8_t)report_type;
+        get_report_bridge.request_len = request_len;
+        get_report_bridge.actual_len = 0;
+        get_report_bridge.done = false;
+        get_report_bridge.pending = true;
+        __dmb();
+
+        uint32_t start_us = time_us_32();
+        while (!get_report_bridge.done &&
+               (uint32_t)(time_us_32() - start_us) < PASSTHROUGH_GET_TIMEOUT_US) {
+            watchdog_core0_heartbeat();
+            sleep_us(100);
+        }
+
+        if (get_report_bridge.done && get_report_bridge.actual_len > 0) {
+            uint16_t actual_len = get_report_bridge.actual_len;
+            uint16_t src_offset = 0;
+            if (report_id != 0 && actual_len > 0 && get_report_bridge.data[0] == report_id) {
+                src_offset = 1;
+            }
+
+            if (actual_len > src_offset) {
+                uint16_t available = actual_len - src_offset;
+                uint16_t copy_len = (available < reqlen) ? available : reqlen;
+                memcpy(buffer, &get_report_bridge.data[src_offset], copy_len);
+                cache_report(instance, report_id, (uint8_t)report_type, buffer, (uint8_t)copy_len);
+                get_report_bridge.done = false;
+                return copy_len;
+            }
+        }
+
+        get_report_bridge.done = false;
+    }
 
     // Look up cached report from the real device
     cached_report_t *slots = report_cache[instance];
     __dmb();  // Ensure we see Core1's latest cache writes
     for (int i = 0; i < REPORT_CACHE_SLOTS_PER_ITF; i++) {
-        if (slots[i].valid && slots[i].report_id == report_id) {
+        if (slots[i].valid && slots[i].report_id == report_id && slots[i].report_type == (uint8_t)report_type) {
             uint16_t copy_len = (slots[i].len < reqlen) ? slots[i].len : reqlen;
             memcpy(buffer, slots[i].data, copy_len);
             return copy_len;
@@ -2756,8 +2904,17 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
             e->host_instance = mitf->host_instance;
             e->report_id = report_id;
             e->report_type = (uint8_t)report_type;
-            e->len = (bufsize > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : (uint8_t)bufsize;
-            memcpy(e->data, buffer, e->len);
+            if (report_id != 0) {
+                e->data[0] = report_id;
+                uint8_t copy_len = (bufsize >= (VENDOR_REPORT_MAX_LEN - 1)) ? (VENDOR_REPORT_MAX_LEN - 1) : (uint8_t)bufsize;
+                memcpy(&e->data[1], buffer, copy_len);
+                e->len = (uint8_t)(copy_len + 1);
+            } else {
+                e->len = (bufsize > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : (uint8_t)bufsize;
+                memcpy(e->data, buffer, e->len);
+            }
+            cache_report(instance, report_id, (uint8_t)report_type, buffer,
+                         (bufsize > VENDOR_REPORT_MAX_LEN) ? VENDOR_REPORT_MAX_LEN : (uint8_t)bufsize);
             __dmb();
             set_report_queue.head = next_head;
         }
