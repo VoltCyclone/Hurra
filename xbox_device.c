@@ -100,6 +100,8 @@ static bool     announce_sent = false;
 
 // OUT endpoint receive buffer
 static uint8_t  ep_out_buf[GIP_MAX_PACKET_SIZE];
+static uint8_t proxy_in_buf[GIP_MAX_PACKET_SIZE];
+static uint8_t pending_in_len;
 
 // Cached merged report for sending
 static uint8_t  report_buf[GIP_HEADER_SIZE + sizeof(xbox_input_report_t)];
@@ -114,11 +116,13 @@ static uint16_t xbox_desc_str[32 + 1];
 static void xbox_device_driver_init(void) {
     xbox_dev_mounted = false;
     announce_sent = false;
+    pending_in_len = 0;
 }
 
 static bool xbox_device_driver_deinit(void) {
     xbox_dev_mounted = false;
     announce_sent = false;
+    pending_in_len = 0;
     xbox_dev_ep_in = 0;
     xbox_dev_ep_out = 0;
     return true;
@@ -128,6 +132,7 @@ static void xbox_device_driver_reset(uint8_t rhport) {
     (void)rhport;
     xbox_dev_mounted = false;
     announce_sent = false;
+    pending_in_len = 0;
     xbox_dev_ep_in = 0;
     xbox_dev_ep_out = 0;
 }
@@ -230,15 +235,14 @@ static void xbox_send_announce(void) {
 
     // GIP announce: command=0x02, flags=0x20, seq=0, length=varies
     // This tells the console "I am an Xbox controller"
-    uint8_t announce_pkt[] = {
+    static uint8_t announce_pkt[] = {
         GIP_CMD_ANNOUNCE, GIP_FLAG_INTERNAL, 0x00, 0x09,
         // Payload: device info (simplified announce)
         0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00
     };
 
     if (usbd_edpt_busy(0, xbox_dev_ep_in)) return;
-    usbd_edpt_xfer(0, xbox_dev_ep_in, announce_pkt, sizeof(announce_pkt));
-    announce_sent = true;
+    announce_sent = usbd_edpt_xfer(0, xbox_dev_ep_in, announce_pkt, sizeof(announce_pkt));
 }
 
 //--------------------------------------------------------------------+
@@ -320,11 +324,15 @@ void __not_in_flash_func(xbox_device_task)(void) {
     // Forward one packet per call from host_to_device_queue to console.
     // Only pop when the endpoint is free to avoid dropping packets.
     gip_packet_queue_t *h2d = xbox_host_get_h2d_queue();
-    if (xbox_dev_ep_in && !usbd_edpt_busy(0, xbox_dev_ep_in) && !gip_queue_empty(h2d)) {
-        uint8_t pkt_buf[GIP_MAX_PACKET_SIZE];
-        uint8_t pkt_len;
-        if (gip_queue_pop(h2d, pkt_buf, &pkt_len)) {
-            usbd_edpt_xfer(0, xbox_dev_ep_in, pkt_buf, pkt_len);
+    if (xbox_dev_ep_in && !usbd_edpt_busy(0, xbox_dev_ep_in)) {
+        if (!pending_in_len && !gip_queue_empty(h2d)) {
+            gip_queue_pop(h2d, proxy_in_buf, &pending_in_len);
+        }
+        if (pending_in_len) {
+            if (usbd_edpt_xfer(0, xbox_dev_ep_in, proxy_in_buf, pending_in_len)) {
+                pending_in_len = 0;
+            }
+            return;
         }
     }
 
@@ -345,7 +353,7 @@ uint16_t const *xbox_get_string_descriptor(uint8_t index, uint16_t langid) {
 
     if (index == 0) {
         xbox_desc_str[1] = 0x0409; // English US
-        xbox_desc_str[0] = (uint16_t)((2 << 8) | TUSB_DESC_STRING);
+        xbox_desc_str[0] = (uint16_t)((TUSB_DESC_STRING << 8) | 4);
         return xbox_desc_str;
     }
 
@@ -361,7 +369,7 @@ uint16_t const *xbox_get_string_descriptor(uint8_t index, uint16_t langid) {
         xbox_desc_str[1 + i] = str[i];
     }
 
-    xbox_desc_str[0] = (uint16_t)(((chr_count * 2 + 2) << 8) | TUSB_DESC_STRING);
+    xbox_desc_str[0] = (uint16_t)((TUSB_DESC_STRING << 8) | (chr_count * 2 + 2));
     return xbox_desc_str;
 }
 
