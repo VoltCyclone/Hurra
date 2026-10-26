@@ -82,5 +82,8 @@ void kmbox_send_xbox_status_to_bridge(void);
 
 // Get TX buffer stats (for debugging/monitoring)
 uint32_t kmbox_get_tx_dropped_bytes(void);
+// Core 0 only. Discarded bytes are a lower bound if ambiguous_polls is nonzero.
+void kmbox_get_rx_loss_stats(uint32_t *overruns, uint64_t *discarded_bytes,
+                            uint32_t *ambiguous_polls);
 
 #endif // KMBOX_SERIAL_HANDLER_H

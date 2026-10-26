@@ -161,52 +161,32 @@ static void __unused write_buffer_dma(void *bstr, size_t len)
 
 void tft_control(uint8_t reg, const uint8_t *bstr, int len)
 {
+	if (len < 0 || (len > 0 && !bstr)) return;
+	// Register commands and parameters are byte streams, even though pixels
+	// use 16-bit DMA. This also handles odd parameter counts without padding.
+	spi_set_format(TFT_SPI_DEV, 8, 0, 0, SPI_MSB_FIRST);
 	select_register();
 	select_chip(true);
 	spi_write_blocking(TFT_SPI_DEV, &reg, 1);
-
 	select_data();
-
-	for (int i = 0; i < len; i += 2) {
-		uint16_t tmp = (bstr[i] << 8) | bstr[i + 1];
-		spi_write16_blocking(TFT_SPI_DEV, &tmp, 1);
-	}
-
-	if (len & 1) {
-		uint16_t tmp = bstr[len - 1] << 8;
-		spi_write16_blocking(TFT_SPI_DEV, &tmp, 1);
-	}
-
+	if (len > 0) spi_write_blocking(TFT_SPI_DEV, bstr, (size_t)len);
 	select_chip(false);
+	spi_set_format(TFT_SPI_DEV, 16, 0, 0, SPI_MSB_FIRST);
 }
 
 #if defined(TFT_MISO_PIN)
 void tft_read(uint8_t reg, uint8_t *bstr, int len, int delay_us)
 {
+	if (len < 0 || (len > 0 && !bstr)) return;
+	spi_set_format(TFT_SPI_DEV, 8, 0, 0, SPI_MSB_FIRST);
 	select_register();
 	select_chip(true);
 	spi_write_blocking(TFT_SPI_DEV, &reg, 1);
-
-	if (delay_us >= 0)
-		sleep_us(delay_us);
-
+	if (delay_us >= 0) sleep_us(delay_us);
 	select_data();
-
-	const uint16_t blank = 0;
-	uint16_t tmp;
-
-	for (int i = 0; i < len; i += 2) {
-		spi_read16_blocking(TFT_SPI_DEV, blank, &tmp, 1);
-		bstr[i] = tmp >> 8;
-		bstr[i + 1] = tmp;
-	}
-
-	if (len & 1) {
-		spi_read16_blocking(TFT_SPI_DEV, blank, &tmp, 1);
-		bstr[len - 1] = tmp >> 8;
-	}
-
+	if (len > 0) spi_read_blocking(TFT_SPI_DEV, 0, bstr, (size_t)len);
 	select_chip(false);
+	spi_set_format(TFT_SPI_DEV, 16, 0, 0, SPI_MSB_FIRST);
 }
 #endif
 
@@ -349,8 +329,62 @@ void tft_swap_buffers(void)
 	tft_input = tmp;
 }
 
+static bool async_active;
+#if !TFT_HW_ACCEL
+static int async_row;
+static int async_repeat;
+#endif
+
+bool tft_sync_start(void)
+{
+	if (async_active) return false;
+#if TFT_HW_ACCEL
+	// The optional chained PIO path retains its synchronous implementation.
+	tft_sync();
+#else
+	tft_begin_sync();
+	select_chip(true);
+	async_row = 0;
+	async_repeat = 0;
+	async_active = true;
+#endif
+	return true;
+}
+
+bool tft_sync_poll(void)
+{
+#if !TFT_HW_ACCEL
+	if (!async_active) return true;
+	if (dma_channel_is_busy(dma_ch_spi)) return false;
+	if (async_row == TFT_RAW_HEIGHT / TFT_SCALE) {
+		// DMA completion can precede the final bits leaving the SPI shifter.
+		if (spi_is_busy(TFT_SPI_DEV)) return false;
+		select_chip(false);
+		async_active = false;
+		return true;
+	}
+	if (async_repeat == 0) {
+		const uint8_t *src = tft_committed + async_row * (TFT_RAW_WIDTH / TFT_SCALE);
+		uint16_t *dst = txbuf[0];
+		for (int x = 0; x < TFT_RAW_WIDTH / TFT_SCALE; x++) {
+			uint16_t color = tft_palette[src[x]];
+			for (int n = 0; n < TFT_SCALE; n++) *dst++ = color;
+		}
+	}
+	dma_channel_transfer_from_buffer_now(dma_ch_spi, txbuf[0], TFT_RAW_WIDTH);
+	if (++async_repeat == TFT_SCALE) {
+		async_repeat = 0;
+		async_row++;
+	}
+	return false;
+#else
+	return true;
+#endif
+}
+
 void tft_sync(void)
 {
+	while (!tft_sync_poll()) tight_loop_contents();
 #if TFT_HW_ACCEL
 	tft_begin_sync();
 	select_chip(true);
@@ -404,6 +438,7 @@ void tft_sync(void)
 
 void tft_swap_sync(void)
 {
+	while (!tft_sync_poll()) tight_loop_contents();
 	tft_swap_buffers();
 	tft_sync();
 }

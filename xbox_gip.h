@@ -116,7 +116,7 @@ typedef struct {
 static inline void gip_queue_init(gip_packet_queue_t *q, unsigned int spin_lock_num) {
     q->head = 0;
     q->tail = 0;
-    q->lock = spin_lock_instance(spin_lock_num);
+    q->lock = spin_lock_init(spin_lock_num);
 }
 
 static inline bool gip_queue_push(gip_packet_queue_t *q, const uint8_t *data, uint8_t len) {

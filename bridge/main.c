@@ -482,6 +482,11 @@ static void uart_rx_task(void) {
     // Batch read up to 64 bytes at once from DMA ring buffer (single memcpy)
     uint8_t rx_batch[64];
     size_t batch_count = hw_uart_read(rx_batch, sizeof(rx_batch));
+    if (hw_uart_rx_take_loss()) {
+        in_binary_packet = false;
+        binary_idx = 0;
+        status_buffer_idx = 0;
+    }
     if (batch_count == 0) return;
     
     for (size_t batch_i = 0; batch_i < batch_count; batch_i++) {
@@ -497,7 +502,9 @@ static void uart_rx_task(void) {
         }
         
         // Check for start of binary response packet (0xFF, 0xFE, 0x0D, or 0x0E from KMBox)
-        if (!in_binary_packet && (c == 0xFF || c == 0xFE || c == 0x0D || c == 0x0E)) {
+        if (!in_binary_packet && (c == FAST_CMD_RESPONSE || c == FAST_CMD_PING ||
+                                  (c == FAST_CMD_INFO && status_buffer_idx == 0) ||
+                                  c == FAST_CMD_INFO_EXT || c == FAST_CMD_XBOX_STATUS)) {
             in_binary_packet = true;
             binary_idx = 0;
             binary_packet[binary_idx++] = c;
@@ -517,7 +524,7 @@ static void uart_rx_task(void) {
             binary_packet[binary_idx++] = c;
             if (binary_idx >= 8) {
                 // Complete packet received
-                if (binary_packet[0] == 0xFF) {
+                if (binary_packet[0] == FAST_CMD_RESPONSE) {
                     // Ping/response packet
                     kmbox_response_count++;
                     
@@ -672,7 +679,7 @@ static void kmbox_connection_task(void) {
             last_humanization_request_ms = now - HUMANIZATION_REQUEST_INTERVAL_MS + HUMANIZATION_INITIAL_DELAY_MS;
             
             // Send initial info request right away (binary)
-            uint8_t info_req[8] = {0x0D, 0, 0, 0, 0, 0, 0, 0};
+            uint8_t info_req[8] = {FAST_CMD_INFO_REQUEST, 0, 0, 0, 0, 0, 0, 0};
             send_uart_packet(info_req, 8);
         }
     }
@@ -700,7 +707,7 @@ static void kmbox_connection_task(void) {
             static uint8_t info_cycle = 0;
             if (info_cycle % 2 == 0) {
                 // Primary: humanization mode, inject mode, queue depth, temperature, flags
-                uint8_t info_req[8] = {0x0D, 0, 0, 0, 0, 0, 0, 0};
+                uint8_t info_req[8] = {FAST_CMD_INFO_REQUEST, 0, 0, 0, 0, 0, 0, 0};
                 send_uart_packet(info_req, 8);
             } else {
                 // Extended: total injected, queue overflows, queue capacity
@@ -739,7 +746,7 @@ static void kmbox_connection_task(void) {
         // Send 0x0D info request even when disconnected to test UART RX
         if (now - last_humanization_request_ms >= HUMANIZATION_REQUEST_INTERVAL_MS) {
             last_humanization_request_ms = now;
-            uint8_t info_req[8] = {0x0D, 0, 0, 0, 0, 0, 0, 0};
+            uint8_t info_req[8] = {FAST_CMD_INFO_REQUEST, 0, 0, 0, 0, 0, 0, 0};
             bool sent = send_uart_packet(info_req, 8);
 
             // Debug: confirm we're sending the request
@@ -923,8 +930,9 @@ static void handle_text_command(const char* cmd) {
     // km.click(btn) - mouse click (convert to binary)
     int btn;
     if (kmbox_parse_click_command(cmd, &btn)) {
-        uint8_t pkt[8] = {0x02, (uint8_t)btn, 1, 0, 0, 0, 0, 0};
-        send_uart_packet(pkt, 8);
+        uint8_t pkt[FAST_CMD_PACKET_SIZE];
+        fast_build_mouse_click(pkt, (uint8_t)(1u << btn), 1);
+        send_uart_packet(pkt, sizeof(pkt));
         return;
     }
     
@@ -1404,7 +1412,7 @@ static void tft_submit_stats_task(void) {
     stats.button_presses = button_press_count;
     stats.commands_per_sec = commands_per_sec;
     
-    stats.uart_errors = uart_error_count;
+    stats.uart_errors = uart_error_count + uart_rx_overflows;
     stats.frame_errors = frame_error_count;
     
     stats.cpu_freq_mhz = clock_get_hz(clk_sys) / 1000000;
@@ -1519,9 +1527,9 @@ int main(void) {
         // Process menu requests (from TFT menu view)
         if (tft_menu_request.set_humanization_mode) {
             tft_menu_request.set_humanization_mode = false;
-            // WIRE_CONFIG: [0x0B][param=0x02][value]
-            uint8_t config_pkt[3] = {0x0B, 0x02, tft_menu_request.humanization_mode_val};
-            send_uart_packet(config_pkt, 3);
+            uint8_t config_pkt[FAST_CMD_PACKET_SIZE];
+            fast_build_set_human(config_pkt, tft_menu_request.humanization_mode_val);
+            send_uart_packet(config_pkt, sizeof(config_pkt));
             printf("[Bridge] Menu: set humanization mode -> %d\n", tft_menu_request.humanization_mode_val);
         }
         if (tft_menu_request.set_max_per_frame || tft_menu_request.set_velocity_matching) {
@@ -1530,9 +1538,9 @@ int main(void) {
                           (kmbox_velocity_matching ? 1 : 0);
             tft_menu_request.set_max_per_frame = false;
             tft_menu_request.set_velocity_matching = false;
-            // WIRE_SMOOTH_CFG: [0x0C][max_per_frame][vel_match]
-            uint8_t smooth_cfg_pkt[3] = {0x0C, mpf, vel};
-            send_uart_packet(smooth_cfg_pkt, 3);
+            uint8_t smooth_cfg_pkt[FAST_CMD_PACKET_SIZE];
+            fast_build_smooth_config(smooth_cfg_pkt, mpf, vel);
+            send_uart_packet(smooth_cfg_pkt, sizeof(smooth_cfg_pkt));
             printf("[Bridge] Menu: smooth cfg mpf=%d vel=%d\n", mpf, vel);
         }
         if (tft_menu_request.set_inject_mode) {

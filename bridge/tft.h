@@ -87,6 +87,9 @@ void tft_swap_buffers(void);
  * Blocks until it's done so the you do not clobber the back buffer.
  */
 void tft_sync(void);
+// Cooperative row-DMA refresh (software LUT path). Poll once per main-loop pass.
+bool tft_sync_start(void);
+bool tft_sync_poll(void);
 
 /* Shortcut to swap buffers and sync at once. */
 void tft_swap_sync(void);

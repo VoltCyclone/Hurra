@@ -9,7 +9,7 @@
  * - Hardware UART0 for reliable, high-speed communication
  * - DMA TX for non-blocking, zero-CPU transmission
  * - DMA RX with circular buffer for continuous reception
- * - IRQ-based fallback for compatibility
+ * - Polled DMA completion without per-packet interrupts
  */
 
 #ifndef HW_UART_H
@@ -22,7 +22,12 @@
 
 // DMA buffer sizes (must be power of 2 for ring buffer)
 #define HW_UART_TX_BUFFER_SIZE  512     // 512B for burst TX at 3 Mbaud
-#define HW_UART_RX_BUFFER_SIZE  PICO_STDIO_STACK_BUFFER_SIZE
+#ifndef HW_UART_RX_BUFFER_SIZE
+#define HW_UART_RX_BUFFER_SIZE  2048    // Independent of SDK printf stack buffers
+#endif
+_Static_assert(HW_UART_RX_BUFFER_SIZE >= 2 && HW_UART_RX_BUFFER_SIZE <= 32768 &&
+               (HW_UART_RX_BUFFER_SIZE & (HW_UART_RX_BUFFER_SIZE - 1)) == 0,
+               "UART RX DMA ring must be a power of two, at most 32768 bytes");
 
 /**
  * Initialize hardware UART with DMA support
@@ -86,6 +91,11 @@ int hw_uart_getc(void);
  * @return Number of bytes read
  */
 size_t hw_uart_read(uint8_t *buf, size_t maxlen);
+
+// Consume a loss notification after read/count; reset any partial protocol state.
+bool hw_uart_rx_take_loss(void);
+// Discarded bytes are a lower bound when ambiguous_polls is nonzero.
+void hw_uart_get_rx_loss_stats(uint64_t *discarded_bytes, uint32_t *ambiguous_polls);
 
 /**
  * Check if TX is ready for more data

@@ -46,8 +46,8 @@ static uint8_t ic_hysteresis = 0;
 static inline void input_classifier_record_move(int16_t dx, int16_t dy) {
     ic_move_count++;
     // Use integer abs
-    int16_t ax = dx < 0 ? -dx : dx;
-    int16_t ay = dy < 0 ? -dy : dy;
+    int32_t ax = dx < 0 ? -(int32_t)dx : dx;
+    int32_t ay = dy < 0 ? -(int32_t)dy : dy;
     ic_total_magnitude += (uint32_t)(ax + ay);
 }
 

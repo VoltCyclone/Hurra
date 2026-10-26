@@ -8,7 +8,28 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include "hardware/sync.h"
+
+// Protocol replies use a dedicated sink; diagnostic printf stays on stdio.
+static kmbox_output_callback_t output_callback;
+
+void kmbox_set_output_callback(kmbox_output_callback_t callback)
+{
+    output_callback = callback;
+}
+
+static bool reply_printf(const char *format, ...)
+{
+    char buffer[256];
+    va_list args;
+    va_start(args, format);
+    int len = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    if (len < 0 || (size_t)len >= sizeof(buffer)) return false;
+    if (output_callback) return output_callback(buffer, (size_t)len);
+    return fwrite(buffer, 1, (size_t)len, stdout) == (size_t)len;
+}
 
 //--------------------------------------------------------------------+
 // Hardware Spinlock for Cross-Core Accumulator Safety
@@ -16,7 +37,6 @@
 // forwarding) both read/write the mouse accumulators.  A hardware spinlock
 // ensures atomic read-modify-write without disabling interrupts globally.
 //--------------------------------------------------------------------+
-#define KMBOX_ACCUMULATOR_SPINLOCK_NUM 16  // Use spinlock 16 (0-15 reserved by SDK)
 static spin_lock_t *g_acc_spinlock;
 
 //--------------------------------------------------------------------+
@@ -53,6 +73,7 @@ static const char* lock_button_names[KMBOX_BUTTON_COUNT] = {
 // Static Variables
 //--------------------------------------------------------------------+
 
+static uint8_t g_injected_buttons;
 static kmbox_state_t g_kmbox_state; // zero-initialized by default (static storage)
 static kmbox_parser_t g_parser;     // zero-initialized by default (static storage)
 
@@ -186,6 +207,9 @@ static void set_button_state(kmbox_button_t button, bool pressed, uint32_t curre
         if (btn_state->is_forced && btn_state->is_pressed) {
             btn_state->is_pressed = false;
             btn_state->release_time = current_time_ms + get_random_release_time();
+            // Zero is reserved for an indefinite press; defer this rare deadline
+            // by one millisecond if it lands exactly on the clock rollover.
+            if (btn_state->release_time == 0) btn_state->release_time = 1;
             btn_state->is_clicking = false; // Cancel any ongoing click
         }
     }
@@ -239,7 +263,7 @@ static void send_button_state_callback(uint8_t button_state)
 {
     // Send the callback in the format: km.[button_state]\r\n>>> 
     // where button_state is the raw character representing the bitmap
-    printf("km.%c\r\n>>> ", button_state);
+    reply_printf("km.%c\r\n>>> ", button_state);
 }
 
 //--------------------------------------------------------------------+
@@ -293,7 +317,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         size_t arg_len = paren_end - arg_start;
         if (arg_len == 0) {
             // No argument - return monitor state with result
-            printf("%d\r\n>>> ", g_kmbox_state.monitor_enabled ? 1 : 0);
+            reply_printf("%d\r\n>>> ", g_kmbox_state.monitor_enabled ? 1 : 0);
             return;
         }
         
@@ -313,7 +337,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         g_kmbox_state.monitor_enabled = (state != 0);
         
         // Send the prompt
-        printf(">>> ");
+        reply_printf(">>> ");
         return;
     }
     
@@ -357,7 +381,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         }
         
         // Output format: result then prompt
-        printf("%d\r\n>>> ", state);
+        reply_printf("%d\r\n>>> ", state);
         return;
     }
     
@@ -379,12 +403,12 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         sum_movement_since(since, now, &sx, &sy);
 
         // Output format: (x, y) then prompt
-        printf("(%ld, %ld)\r\n>>> ", (long)sx, (long)sy);
+        reply_printf("(%ld, %ld)\r\n>>> ", (long)sx, (long)sy);
         return;
     }
 
     // Echo the command back with the original line terminator
-    printf("%s%.*s", cmd, g_parser.terminator_len, g_parser.command_terminator);
+    reply_printf("%s%.*s", cmd, g_parser.terminator_len, g_parser.command_terminator);
     
     // Check if this is a move command
     if ((is_km && strncmp(cmd + 3, "move(", 5) == 0) || is_alias_move) {
@@ -451,7 +475,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         kmbox_add_mouse_movement(x_amount, y_amount);
         
         // Send the prompt
-        printf(">>> ");
+        reply_printf(">>> ");
         return;
     }
     
@@ -471,7 +495,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         kmbox_add_wheel_movement((int8_t)wheel_amount);
         
         // Send the prompt
-        printf(">>> ");
+        reply_printf(">>> ");
         return;
     }
     
@@ -489,7 +513,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         size_t arg_len = paren_end - arg_start;
         if (arg_len == 0) {
             // No argument - return lock state with result
-            printf("%d\r\n>>> ", g_kmbox_state.lock_mx ? 1 : 0);
+            reply_printf("%d\r\n>>> ", g_kmbox_state.lock_mx ? 1 : 0);
             return;
         }
         
@@ -512,7 +536,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         g_kmbox_state.lock_mx = (state == 1);
         
         // Send the prompt
-        printf(">>> ");
+        reply_printf(">>> ");
         return;
     }
     
@@ -530,7 +554,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         size_t arg_len = paren_end - arg_start;
         if (arg_len == 0) {
             // No argument - return lock state with result
-            printf("%d\r\n>>> ", g_kmbox_state.lock_my ? 1 : 0);
+            reply_printf("%d\r\n>>> ", g_kmbox_state.lock_my ? 1 : 0);
             return;
         }
         
@@ -553,7 +577,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         g_kmbox_state.lock_my = (state == 1);
         
         // Send the prompt
-        printf(">>> ");
+        reply_printf(">>> ");
         return;
     }
     
@@ -571,7 +595,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         size_t arg_len = paren_end - arg_start;
         if (arg_len == 0) {
             // No argument - return transform state
-            printf("(%d, %d, %d)\r\n>>> ", 
+            reply_printf("(%d, %d, %d)\r\n>>> ",
                    g_kmbox_state.transform_scale_x,
                    g_kmbox_state.transform_scale_y,
                    g_kmbox_state.transform_enabled ? 1 : 0);
@@ -583,7 +607,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         if (sscanf(arg_start, "%d , %d , %d", &scale_x, &scale_y, &enabled) == 3 ||
             sscanf(arg_start, "%d,%d,%d", &scale_x, &scale_y, &enabled) == 3) {
             kmbox_set_transform((int16_t)scale_x, (int16_t)scale_y, enabled != 0);
-            printf(">>> ");
+            reply_printf(">>> ");
         }
         return;
     }
@@ -604,7 +628,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         start_button_click((kmbox_button_t)button_num, current_time_ms);
         
         // Send the prompt
-        printf(">>> ");
+        reply_printf(">>> ");
         return;
     }
     
@@ -622,7 +646,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         size_t arg_len = paren_end - arg_start;
         if (arg_len == 0) {
             // No argument - return callback state with result
-            printf("%d\r\n>>> ", g_kmbox_state.button_callback_enabled ? 1 : 0);
+            reply_printf("%d\r\n>>> ", g_kmbox_state.button_callback_enabled ? 1 : 0);
             return;
         }
         
@@ -645,7 +669,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         g_kmbox_state.button_callback_enabled = (state == 1);
         
         // Send the prompt
-        printf(">>> ");
+        reply_printf(">>> ");
         return;
     }
     
@@ -687,7 +711,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         if (arg_len == 0) {
             // No argument - return lock state with result
             bool is_locked = get_button_lock(button);
-            printf("%d\r\n>>> ", is_locked ? 1 : 0);
+            reply_printf("%d\r\n>>> ", is_locked ? 1 : 0);
             return;
         }
         
@@ -710,7 +734,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         set_button_lock(button, state == 1);
         
         // Send the prompt
-        printf(">>> ");
+        reply_printf(">>> ");
         return;
     }
     
@@ -760,7 +784,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
         if (*p == '\0') {
             // Getter: print current state (1 pressed, 0 released)
             int pressed = g_kmbox_state.buttons[button].is_pressed ? 1 : 0;
-            printf("%d\r\n>>> ", pressed);
+            reply_printf("%d\r\n>>> ", pressed);
             return;
         }
     }
@@ -775,7 +799,7 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
     set_button_state(button, state == 1, current_time_ms);
 
     // Per spec, echo the command then print the prompt only
-    printf(">>> ");
+    reply_printf(">>> ");
 }
 
 //--------------------------------------------------------------------+
@@ -785,8 +809,9 @@ static void parse_command(const char* cmd, uint32_t current_time_ms)
 void kmbox_commands_init(void)
 {
     // Claim hardware spinlock for accumulator protection
-    g_acc_spinlock = spin_lock_init(KMBOX_ACCUMULATOR_SPINLOCK_NUM);
+    if (!g_acc_spinlock) g_acc_spinlock = spin_lock_init((unsigned)spin_lock_claim_unused(true));
     // Initialize state
+    __atomic_store_n(&g_injected_buttons, 0, __ATOMIC_RELEASE);
     memset(&g_kmbox_state, 0, sizeof(g_kmbox_state));
     memset(&g_parser, 0, sizeof(g_parser));
     
@@ -936,7 +961,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         
         // Handle click sequence
         if (btn->is_clicking) {
-            if (current_time_ms >= btn->click_end_time) {
+            if ((int32_t)(current_time_ms - btn->click_end_time) >= 0) {
                 // Click sequence complete, return to hardware state
                 btn->is_clicking = false;
                 btn->is_forced = false;
@@ -946,7 +971,7 @@ void kmbox_update_states(uint32_t current_time_ms)
                 // Restore physical button state
                 bool physical_pressed = (g_kmbox_state.physical_buttons & 0x01) != 0;
                 btn->is_pressed = physical_pressed;
-            } else if (current_time_ms >= btn->click_release_start) {
+            } else if ((int32_t)(current_time_ms - btn->click_release_start) >= 0) {
                 // In release phase of click
                 btn->is_pressed = false;
             }
@@ -954,7 +979,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         }
         // Check if a forced release has expired (for non-click commands)
         else if (btn->is_forced && !btn->is_pressed && btn->release_time > 0) {
-            if (current_time_ms >= btn->release_time) {
+            if ((int32_t)(current_time_ms - btn->release_time) >= 0) {
                 // Release time expired, button returns to physical state
                 btn->is_forced = false;
                 btn->release_time = 0;
@@ -979,7 +1004,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         
         // Handle click sequence
         if (btn->is_clicking) {
-            if (current_time_ms >= btn->click_end_time) {
+            if ((int32_t)(current_time_ms - btn->click_end_time) >= 0) {
                 // Click sequence complete, return to hardware state
                 btn->is_clicking = false;
                 btn->is_forced = false;
@@ -989,7 +1014,7 @@ void kmbox_update_states(uint32_t current_time_ms)
                 // Restore physical button state
                 bool physical_pressed = (g_kmbox_state.physical_buttons & 0x02) != 0;
                 btn->is_pressed = physical_pressed;
-            } else if (current_time_ms >= btn->click_release_start) {
+            } else if ((int32_t)(current_time_ms - btn->click_release_start) >= 0) {
                 // In release phase of click
                 btn->is_pressed = false;
             }
@@ -997,7 +1022,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         }
         // Check if a forced release has expired (for non-click commands)
         else if (btn->is_forced && !btn->is_pressed && btn->release_time > 0) {
-            if (current_time_ms >= btn->release_time) {
+            if ((int32_t)(current_time_ms - btn->release_time) >= 0) {
                 // Release time expired, button returns to physical state
                 btn->is_forced = false;
                 btn->release_time = 0;
@@ -1022,7 +1047,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         
         // Handle click sequence
         if (btn->is_clicking) {
-            if (current_time_ms >= btn->click_end_time) {
+            if ((int32_t)(current_time_ms - btn->click_end_time) >= 0) {
                 // Click sequence complete, return to hardware state
                 btn->is_clicking = false;
                 btn->is_forced = false;
@@ -1032,7 +1057,7 @@ void kmbox_update_states(uint32_t current_time_ms)
                 // Restore physical button state
                 bool physical_pressed = (g_kmbox_state.physical_buttons & 0x04) != 0;
                 btn->is_pressed = physical_pressed;
-            } else if (current_time_ms >= btn->click_release_start) {
+            } else if ((int32_t)(current_time_ms - btn->click_release_start) >= 0) {
                 // In release phase of click
                 btn->is_pressed = false;
             }
@@ -1040,7 +1065,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         }
         // Check if a forced release has expired (for non-click commands)
         else if (btn->is_forced && !btn->is_pressed && btn->release_time > 0) {
-            if (current_time_ms >= btn->release_time) {
+            if ((int32_t)(current_time_ms - btn->release_time) >= 0) {
                 // Release time expired, button returns to physical state
                 btn->is_forced = false;
                 btn->release_time = 0;
@@ -1065,7 +1090,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         
         // Handle click sequence
         if (btn->is_clicking) {
-            if (current_time_ms >= btn->click_end_time) {
+            if ((int32_t)(current_time_ms - btn->click_end_time) >= 0) {
                 // Click sequence complete, return to hardware state
                 btn->is_clicking = false;
                 btn->is_forced = false;
@@ -1075,7 +1100,7 @@ void kmbox_update_states(uint32_t current_time_ms)
                 // Restore physical button state
                 bool physical_pressed = (g_kmbox_state.physical_buttons & 0x08) != 0;
                 btn->is_pressed = physical_pressed;
-            } else if (current_time_ms >= btn->click_release_start) {
+            } else if ((int32_t)(current_time_ms - btn->click_release_start) >= 0) {
                 // In release phase of click
                 btn->is_pressed = false;
             }
@@ -1083,7 +1108,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         }
         // Check if a forced release has expired (for non-click commands)
         else if (btn->is_forced && !btn->is_pressed && btn->release_time > 0) {
-            if (current_time_ms >= btn->release_time) {
+            if ((int32_t)(current_time_ms - btn->release_time) >= 0) {
                 // Release time expired, button returns to physical state
                 btn->is_forced = false;
                 btn->release_time = 0;
@@ -1108,7 +1133,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         
         // Handle click sequence
         if (btn->is_clicking) {
-            if (current_time_ms >= btn->click_end_time) {
+            if ((int32_t)(current_time_ms - btn->click_end_time) >= 0) {
                 // Click sequence complete, return to hardware state
                 btn->is_clicking = false;
                 btn->is_forced = false;
@@ -1118,7 +1143,7 @@ void kmbox_update_states(uint32_t current_time_ms)
                 // Restore physical button state
                 bool physical_pressed = (g_kmbox_state.physical_buttons & 0x10) != 0;
                 btn->is_pressed = physical_pressed;
-            } else if (current_time_ms >= btn->click_release_start) {
+            } else if ((int32_t)(current_time_ms - btn->click_release_start) >= 0) {
                 // In release phase of click
                 btn->is_pressed = false;
             }
@@ -1126,7 +1151,7 @@ void kmbox_update_states(uint32_t current_time_ms)
         }
         // Check if a forced release has expired (for non-click commands)
         else if (btn->is_forced && !btn->is_pressed && btn->release_time > 0) {
-            if (current_time_ms >= btn->release_time) {
+            if ((int32_t)(current_time_ms - btn->release_time) >= 0) {
                 // Release time expired, button returns to physical state
                 btn->is_forced = false;
                 btn->release_time = 0;
@@ -1170,12 +1195,7 @@ void kmbox_get_mouse_report(uint8_t* buttons, int8_t* x, int8_t* y, int8_t* whee
     }
     
     // Build button byte from current states - UNROLLED for performance
-    uint8_t button_byte = 
-        (g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_pressed   ? 0x01 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_pressed  ? 0x02 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_pressed ? 0x04 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_pressed  ? 0x08 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_pressed  ? 0x10 : 0);
+    uint8_t button_byte = kmbox_get_current_buttons();
     
     *buttons = button_byte;
     
@@ -1231,12 +1251,7 @@ void kmbox_get_mouse_report_16(uint8_t* buttons, int16_t* x, int16_t* y, int8_t*
     }
     
     // Build button byte
-    uint8_t button_byte = 
-        (g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_pressed   ? 0x01 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_pressed  ? 0x02 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_pressed ? 0x04 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_pressed  ? 0x08 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_pressed  ? 0x10 : 0);
+    uint8_t button_byte = kmbox_get_current_buttons();
     
     *buttons = button_byte;
     
@@ -1380,7 +1395,8 @@ bool kmbox_has_forced_buttons(void)
 {
     // Check if any button is currently forced by a bridge/kmbox command.
     // Unrolled for performance — KMBOX_BUTTON_COUNT is always 5.
-    return g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_forced  |
+    return (__atomic_load_n(&g_injected_buttons, __ATOMIC_ACQUIRE) != 0) |
+           g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_forced  |
            g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_forced |
            g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_forced |
            g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_forced |
@@ -1392,12 +1408,18 @@ void kmbox_start_button_click(kmbox_button_t button, uint32_t current_time_ms)
     start_button_click(button, current_time_ms);
 }
 
+void kmbox_set_injected_buttons(uint8_t buttons)
+{
+    __atomic_store_n(&g_injected_buttons, buttons & 0x1F, __ATOMIC_RELEASE);
+}
+
 uint8_t kmbox_get_current_buttons(void)
 {
     // Return the current combined button byte (physical | forced) without
     // draining any accumulators.  Used by hid_device_task() to detect
     // button-only state changes that need an immediate report.
-    return (g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_pressed   ? 0x01 : 0) |
+    return __atomic_load_n(&g_injected_buttons, __ATOMIC_ACQUIRE) |
+           (g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_pressed   ? 0x01 : 0) |
            (g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_pressed  ? 0x02 : 0) |
            (g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_pressed ? 0x04 : 0) |
            (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_pressed  ? 0x08 : 0) |
@@ -1409,12 +1431,7 @@ bool kmbox_try_drain_mouse_16(uint8_t last_sent_buttons,
                                int8_t *wheel, int8_t *pan)
 {
     // Build button byte (no lock needed — single-core writes)
-    uint8_t button_byte =
-        (g_kmbox_state.buttons[KMBOX_BUTTON_LEFT].is_pressed   ? 0x01 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_RIGHT].is_pressed  ? 0x02 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_MIDDLE].is_pressed ? 0x04 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE1].is_pressed  ? 0x08 : 0) |
-        (g_kmbox_state.buttons[KMBOX_BUTTON_SIDE2].is_pressed  ? 0x10 : 0);
+    uint8_t button_byte = kmbox_get_current_buttons();
 
     *buttons = button_byte;
     bool buttons_changed = (button_byte != last_sent_buttons);
@@ -1562,34 +1579,51 @@ int8_t kmbox_clamp_wheel_i8(int16_t value)
 // Command Parsing Utilities
 //--------------------------------------------------------------------+
 
+static const char *skip_argument_space(const char *p)
+{
+    while (isspace((unsigned char)*p)) p++;
+    return p;
+}
+
+static const char *parse_i16_argument(const char *p, int *value)
+{
+    p = skip_argument_space(p);
+    bool negative = *p == '-';
+    if (*p == '-' || *p == '+') p++;
+    if (!isdigit((unsigned char)*p)) return NULL;
+    uint32_t limit = negative ? 32768u : 32767u;
+    uint32_t result = 0;
+    while (isdigit((unsigned char)*p)) {
+        uint32_t digit = (uint32_t)(*p++ - '0');
+        if (result > (limit - digit) / 10u) return NULL;
+        result = result * 10u + digit;
+    }
+    *value = negative ? -(int)result : (int)result;
+    return skip_argument_space(p);
+}
+
 bool kmbox_parse_move_command(const char* cmd, int* x, int* y)
 {
-    if (!cmd || !x || !y) {
-        return false;
-    }
-    
-    // Check for km.move(x,y) format - allow optional spaces
-    if (strncmp(cmd, "km.move(", 8) != 0) {
-        return false;
-    }
-    
-    // sscanf with space in format allows optional whitespace
-    return sscanf(cmd, "km.move(%d , %d)", x, y) == 2 ||
-           sscanf(cmd, "km.move(%d,%d)", x, y) == 2;
+    if (!cmd || !x || !y || strncmp(cmd, "km.move(", 8) != 0) return false;
+    int parsed_x, parsed_y;
+    const char *p = parse_i16_argument(cmd + 8, &parsed_x);
+    if (!p || *p != ',') return false;
+    p = parse_i16_argument(p + 1, &parsed_y);
+    if (!p || *p != ')' || *skip_argument_space(p + 1) != '\0') return false;
+    *x = parsed_x;
+    *y = parsed_y;
+    return true;
 }
 
 bool kmbox_parse_click_command(const char* cmd, int* button)
 {
-    if (!cmd || !button) {
-        return false;
-    }
-    
-    // Check for km.click(btn) format
-    if (strncmp(cmd, "km.click(", 9) != 0) {
-        return false;
-    }
-    
-    return sscanf(cmd, "km.click(%d)", button) == 1;
+    if (!cmd || !button || strncmp(cmd, "km.click(", 9) != 0) return false;
+    int parsed_button;
+    const char *p = parse_i16_argument(cmd + 9, &parsed_button);
+    if (!p || *p != ')' || *skip_argument_space(p + 1) != '\0' ||
+        parsed_button < 0 || parsed_button >= KMBOX_BUTTON_COUNT) return false;
+    *button = parsed_button;
+    return true;
 }
 
 bool kmbox_is_version_command(const char* cmd)

@@ -14,6 +14,7 @@
 #include "xbox_device.h"
 #include "xbox_host.h"
 #include "uart_buffers.h"
+#include "dma_uart.h"
 #include "dcp_helpers.h"
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
@@ -22,6 +23,7 @@
 #include "hardware/clocks.h"
 #include "hardware/adc.h"
 #include "hardware/dma.h"
+#include "hardware/sync.h"
 #include "pico/time.h"
 #include <string.h>
 #include <stdio.h>
@@ -70,47 +72,99 @@ static __force_inline int16_t read_i16_le(const uint8_t *p) {
 static uint8_t uart_rx_buffer[UART_RX_BUFFER_SIZE] __attribute__((aligned(UART_RX_BUFFER_SIZE)));
 static volatile uint32_t uart_rx_read_pos = 0;
 static int uart_rx_dma_chan = -1;
+static uint32_t uart_rx_poll_write_pos;
+static bool text_discarding;
+static dma_rx_state_t uart_rx_state;
+static uint32_t uart_rx_reported_epoch;
+static bool uart_rx_loss_pending;
 
 //--------------------------------------------------------------------+
-// TX DMA (zero-CPU transmission)
-// Stages data into a linear buffer, then fires a DMA transfer.
-// Much faster than per-byte IRQ TX at 2 Mbaud.
+// Queued UART transmission (DMA when available, otherwise TX IRQ).
+// Records remain owned until DMA completes; queue overflow drops whole records.
 //--------------------------------------------------------------------+
-#define DMA_TX_BUFFER_SIZE  1024
-static uint8_t dma_tx_buffer[DMA_TX_BUFFER_SIZE] __attribute__((aligned(4)));
-static volatile uint16_t dma_tx_len = 0;
+// Fixed-size records preserve message boundaries across DMA/IRQ and both cores.
+#define UART_TX_RECORD_SIZE 256
+#define UART_TX_RECORD_COUNT 8
+#define UART_TX_RECORD_MASK (UART_TX_RECORD_COUNT - 1)
+typedef struct {
+    uint8_t data[UART_TX_RECORD_SIZE];
+    uint16_t len;
+} uart_tx_record_t;
+static uart_tx_record_t tx_records[UART_TX_RECORD_COUNT];
+static uint8_t tx_head, tx_tail;
+static uint16_t tx_offset;
+static bool tx_dma_active;
 static int uart_tx_dma_chan = -1;
-static volatile bool dma_tx_busy = false;
+static spin_lock_t *tx_lock;
+static uint32_t g_uart_tx_dropped;
 
 // DMA-based RX: get current write position from DMA write address
 // __force_inline guarantees inlining even at -Os (Pico SDK macro)
 static __force_inline uint32_t rx_get_write_pos(void) {
-    if (uart_rx_dma_chan < 0) return 0;
+    if (uart_rx_dma_chan < 0) {
+        // Startup and allocation-failure fallback. Reserve one ring slot so
+        // a full buffer cannot masquerade as empty; leave remaining bytes in FIFO.
+        while (uart_is_readable(KMBOX_UART)) {
+            uint32_t next = (uart_rx_poll_write_pos + 1) & UART_RX_BUFFER_MASK;
+            if (next == uart_rx_read_pos) break;
+            uart_rx_buffer[uart_rx_poll_write_pos] = (uint8_t)uart_getc(KMBOX_UART);
+            uart_rx_poll_write_pos = next;
+        }
+        return uart_rx_poll_write_pos;
+    }
     uintptr_t write_addr = (uintptr_t)dma_channel_hw_addr(uart_rx_dma_chan)->write_addr;
     return (uint32_t)((write_addr - (uintptr_t)uart_rx_buffer) & UART_RX_BUFFER_MASK);
 }
 
+static __force_inline void rx_sync_state(void) {
+    uart_rx_read_pos = uart_rx_state.consumed & UART_RX_BUFFER_MASK;
+    if (uart_rx_reported_epoch != uart_rx_state.loss_epoch) {
+        uart_rx_reported_epoch = uart_rx_state.loss_epoch;
+        uart_rx_loss_pending = true;
+        text_discarding = false;
+    }
+}
+
 static __force_inline uint16_t rx_available(void) {
-    return (uint16_t)((rx_get_write_pos() - uart_rx_read_pos) & UART_RX_BUFFER_MASK);
+    if (uart_rx_dma_chan < 0) {
+        return (uint16_t)((rx_get_write_pos() - uart_rx_read_pos) & UART_RX_BUFFER_MASK);
+    }
+    uint32_t avail = dma_rx_poll(&uart_rx_state, uart_rx_dma_chan);
+    rx_sync_state();
+    return (uint16_t)avail;
 }
 
 static __force_inline uint8_t rx_peek_at(uint16_t offset) {
     return uart_rx_buffer[(uart_rx_read_pos + offset) & UART_RX_BUFFER_MASK];
 }
 
+static bool rx_copy_peek(uint8_t *dest, size_t len) {
+    if (len > rx_available()) return false;
+    if (uart_rx_dma_chan >= 0) {
+        bool valid = dma_rx_peek_copy(&uart_rx_state, uart_rx_dma_chan,
+                                      uart_rx_buffer, dest, 0, len);
+        rx_sync_state();
+        return valid;
+    }
+    for (size_t i = 0; i < len; i++) dest[i] = rx_peek_at((uint16_t)i);
+    return true;
+}
+
 static __force_inline void rx_consume(uint16_t count) {
-    uart_rx_read_pos = (uart_rx_read_pos + count) & UART_RX_BUFFER_MASK;
+    if (count > rx_available()) return;
+    if (uart_rx_dma_chan >= 0) {
+        uart_rx_state.consumed += count;
+        rx_sync_state();
+    } else {
+        uart_rx_read_pos = (uart_rx_read_pos + count) & UART_RX_BUFFER_MASK;
+    }
 }
 
 //--------------------------------------------------------------------+
-// TX Ring Buffer (Non-blocking IRQ-based transmission)
+// Forward declarations for the shared TX queue.
 //--------------------------------------------------------------------+
-
-static uart_tx_buffer_t g_uart_tx_buffer;
-static volatile uint32_t g_uart_tx_dropped = 0;
-
-// Forward declaration for DMA TX completion handler
-static void __not_in_flash_func(on_dma_tx_complete)(void);
+static void on_uart_irq(void);
+static void tx_service_locked(void);
 
 //--------------------------------------------------------------------+
 // Connection State
@@ -176,95 +230,92 @@ static uint32_t fast_cmd_count = 0;
 static uint32_t fast_cmd_errors = 0;
 
 //--------------------------------------------------------------------+
-// DMA TX Completion IRQ Handler
+// TX queue service. Call with tx_lock held; never wait for the peripheral.
 //--------------------------------------------------------------------+
-
-static void __not_in_flash_func(on_dma_tx_complete)(void) {
-    // Clear the interrupt
-    if (uart_tx_dma_chan >= 0) {
-        dma_hw->ints0 = (1u << uart_tx_dma_chan);
+static void tx_service_locked(void) {
+    if (uart_tx_dma_chan < 0) {
+        uart_set_irq_enables(KMBOX_UART, false, tx_head != tx_tail);
+        return;
     }
-    dma_tx_busy = false;
+    if (tx_dma_active) {
+        if (dma_channel_is_busy(uart_tx_dma_chan)) return;
+        tx_dma_active = false;
+        tx_tail = (tx_tail + 1) & UART_TX_RECORD_MASK;
+        tx_offset = 0;
+    }
+    if (tx_head == tx_tail) return;
+    uart_tx_record_t *record = &tx_records[tx_tail];
+    dma_channel_set_read_addr(uart_tx_dma_chan, record->data + tx_offset, false);
+    tx_dma_active = true;
+    __dmb();  // Publish slot contents to the DMA bus master before triggering.
+    dma_channel_set_trans_count(uart_tx_dma_chan, record->len - tx_offset, true);
 }
 
-//--------------------------------------------------------------------+
-// UART TX IRQ Handler (fallback before DMA TX is initialized)
-//--------------------------------------------------------------------+
+static void tx_service(void) {
+    if (!tx_lock) return;
+    uint32_t save = spin_lock_blocking(tx_lock);
+    tx_service_locked();
+    spin_unlock(tx_lock, save);
+}
 
 static void __not_in_flash_func(on_uart_irq)(void) {
-    // Handle TX (only used before DMA TX is initialized)
-    if (uart_is_writable(KMBOX_UART) && g_uart_tx_buffer.tx_active) {
-        while (uart_is_writable(KMBOX_UART) && tx_buffer_has_data(&g_uart_tx_buffer)) {
-            int byte = tx_buffer_get(&g_uart_tx_buffer);
-            if (byte >= 0) {
-                uart_putc_raw(KMBOX_UART, (uint8_t)byte);
-            } else {
-                break;
+    uint32_t save = spin_lock_blocking(tx_lock);
+    if (uart_tx_dma_chan < 0) {
+        while (tx_head != tx_tail && uart_is_writable(KMBOX_UART)) {
+            uart_tx_record_t *record = &tx_records[tx_tail];
+            uart_putc_raw(KMBOX_UART, record->data[tx_offset++]);
+            if (tx_offset == record->len) {
+                tx_offset = 0;
+                tx_tail = (tx_tail + 1) & UART_TX_RECORD_MASK;
             }
         }
-        if (!tx_buffer_has_data(&g_uart_tx_buffer)) {
-            uart_set_irq_enables(KMBOX_UART, false, false);
-            g_uart_tx_buffer.tx_active = false;
-        }
+        uart_set_irq_enables(KMBOX_UART, false, tx_head != tx_tail);
     }
+    spin_unlock(tx_lock, save);
 }
 
-// Non-blocking TX: Use DMA if available, fall back to IRQ ring buffer
-static bool uart_send_bytes(const uint8_t *data, size_t len) {
-    if (!data || len == 0) return true;
-
-    // DMA TX path: zero-CPU, zero-wait transmission
-    if (uart_tx_dma_chan >= 0) {
-        // Non-blocking: if DMA is still sending the previous packet, drop this one.
-        // At 3Mbaud, an 8-byte packet takes ~27µs — the previous DMA is almost
-        // always done by the next main loop iteration. The old 500µs spin-wait
-        // blocked tud_task() and hid_device_task(), adding up to 500µs of input latency.
-        // Bridge retries on missed responses, so dropping is safe.
-        if (dma_tx_busy) {
-            g_uart_tx_dropped += len;
-            return false;
-        }
-
-        // Copy data to DMA TX staging buffer
-        size_t to_send = (len > DMA_TX_BUFFER_SIZE) ? DMA_TX_BUFFER_SIZE : len;
-        memcpy(dma_tx_buffer, data, to_send);
-        dma_tx_len = to_send;
-        dma_tx_busy = true;
-
-        // Fire DMA transfer
-        dma_channel_set_read_addr(uart_tx_dma_chan, dma_tx_buffer, false);
-        dma_channel_set_trans_count(uart_tx_dma_chan, to_send, true);
-
-        if (to_send < len) {
-            g_uart_tx_dropped += (len - to_send);
-            return false;
-        }
-        return true;
-    }
-    
-    // Fallback: IRQ-based ring buffer TX (before DMA is initialized)
-    int uart_irq = (KMBOX_UART == uart0) ? UART0_IRQ : UART1_IRQ;
-    irq_set_enabled(uart_irq, false);
-    
-    uint16_t written = tx_buffer_write(&g_uart_tx_buffer, data, len);
-    
-    if (written > 0 && !g_uart_tx_buffer.tx_active) {
-        g_uart_tx_buffer.tx_active = true;
-        uart_set_irq_enables(KMBOX_UART, false, true);
-    }
-    
-    irq_set_enabled(uart_irq, true);
-    
-    if (written < len) {
-        g_uart_tx_dropped += (len - written);
+// Enqueue all bytes or none. CRLF is part of the same record as its body.
+static bool uart_enqueue_record(const uint8_t *data, size_t len, bool crlf) {
+    size_t suffix = crlf ? 2u : 0u;
+    if (!tx_lock) return false;
+    uint32_t save = spin_lock_blocking(tx_lock);
+    if (!data || len > UART_TX_RECORD_SIZE - suffix) {
+        g_uart_tx_dropped += (uint32_t)len + (uint32_t)suffix;
+        spin_unlock(tx_lock, save);
         return false;
     }
+    if (len + suffix == 0) {
+        spin_unlock(tx_lock, save);
+        return true;
+    }
+    // Reclaim a completed DMA record before deciding whether the queue is full.
+    tx_service_locked();
+    uint8_t next = (tx_head + 1) & UART_TX_RECORD_MASK;
+    if (next == tx_tail) {
+        g_uart_tx_dropped += (uint32_t)len + (uint32_t)suffix;
+        spin_unlock(tx_lock, save);
+        return false;
+    }
+    uart_tx_record_t *record = &tx_records[tx_head];
+    memcpy(record->data, data, len);
+    if (crlf) {
+        record->data[len] = '\r';
+        record->data[len + 1] = '\n';
+    }
+    record->len = (uint16_t)(len + suffix);
+    tx_head = next;
+    tx_service_locked();
+    spin_unlock(tx_lock, save);
     return true;
 }
 
-static bool uart_send_string(const char *str) {
-    if (!str) return true;
-    return uart_send_bytes((const uint8_t*)str, strlen(str));
+static bool uart_send_bytes(const uint8_t *data, size_t len) {
+    if (len == 0) return true;
+    return uart_enqueue_record(data, len, false);
+}
+
+static bool command_reply_write(const char *data, size_t len) {
+    return uart_send_bytes((const uint8_t *)data, len);
 }
 
 //--------------------------------------------------------------------+
@@ -273,9 +324,7 @@ static bool uart_send_string(const char *str) {
 
 void kmbox_send_response(const char *response) {
     if (!response) return;
-    uart_send_string(response);
-    uart_send_string("\r\n");
-    // Non-blocking: TX IRQ handles actual transmission
+    uart_enqueue_record((const uint8_t *)response, strlen(response), true);
 }
 
 void kmbox_send_status(const char *message) {
@@ -290,7 +339,11 @@ void kmbox_send_ping_to_bridge(void) {
 
 // Get TX buffer stats (for debugging)
 uint32_t kmbox_get_tx_dropped_bytes(void) {
-    return g_uart_tx_dropped;
+    if (!tx_lock) return 0;
+    uint32_t save = spin_lock_blocking(tx_lock);
+    uint32_t dropped = g_uart_tx_dropped;
+    spin_unlock(tx_lock, save);
+    return dropped;
 }
 
 //--------------------------------------------------------------------+
@@ -400,7 +453,8 @@ static const uint32_t g_fast_cmd_bitmap[8] = {
     //   0x01 MOUSE_MOVE, 0x02 MOUSE_CLICK, 0x07 SMOOTH_MOVE, 0x08 SMOOTH_CONFIG,
     //   0x09 SMOOTH_CLEAR, 0x0B MULTI_MOVE, 0x0C KEY_COMBO, 0x0E INFO_EXT, 0x0F CYCLE_HUMAN
     (1u << 0x01) | (1u << 0x02) | (1u << 0x07) | (1u << 0x08) |
-    (1u << 0x09) | (1u << 0x0B) | (1u << 0x0C) | (1u << 0x0E) | (1u << 0x0F),
+    (1u << 0x09) | (1u << 0x0B) | (1u << 0x0C) | (1u << 0x0E) | (1u << 0x0F) |
+    (1u << FAST_CMD_SET_HUMAN) | (1u << FAST_CMD_INFO_REQUEST),
     // Bits 32-63:  Xbox commands 0x20-0x28
     (1u << (0x20 - 32)) | (1u << (0x22 - 32)) | (1u << (0x23 - 32)) |
     (1u << (0x27 - 32)) | (1u << (0x28 - 32)),
@@ -421,7 +475,7 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
     // - Skips neopixel flash (too expensive for high-rate moves)
     if (__builtin_expect(pkt[0] == FAST_CMD_MOUSE_MOVE, 1)) {
         const fast_cmd_move_t *m = (const fast_cmd_move_t *)pkt;
-        if (m->buttons) kmbox_update_physical_buttons(m->buttons & 0x1F);
+        kmbox_set_injected_buttons(m->buttons);
         if (m->x || m->y) kmbox_add_mouse_movement(m->x, m->y);
         if (m->wheel) kmbox_add_wheel_movement(m->wheel);
         // Passive LED activity — single volatile store, DMA pushes to PIO at ~30 Hz
@@ -434,22 +488,22 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
         
         case FAST_CMD_MOUSE_CLICK: {
             const fast_cmd_click_t *c = (const fast_cmd_click_t *)pkt;
-            // Map button number to kmbox_button_t enum
+            // The fast protocol carries a HID button mask, not a button number.
             // FAST_BTN: 1=left, 2=right, 4=middle, 8=side1, 16=side2
             kmbox_button_t btn;
             switch (c->button) {
                 case 0: case 1: btn = KMBOX_BUTTON_LEFT;   break;
                 case 2:         btn = KMBOX_BUTTON_RIGHT;  break;
-                case 3:         btn = KMBOX_BUTTON_MIDDLE; break;
-                case 4:         btn = KMBOX_BUTTON_SIDE1;  break;
-                case 5:         btn = KMBOX_BUTTON_SIDE2;  break;
-                default:        btn = KMBOX_BUTTON_LEFT;   break;
+                case 4:         btn = KMBOX_BUTTON_MIDDLE; break;
+                case 8:         btn = KMBOX_BUTTON_SIDE1;  break;
+                case 16:        btn = KMBOX_BUTTON_SIDE2;  break;
+                default:        return false;
             }
             // Use timed click mechanism — press/hold/release with randomized
             // timing, handled by kmbox_update_states() on each main loop tick.
             // Only single-click is supported; the count field is ignored for now
             // because multi-click requires waiting for each click to complete.
-            uint32_t click_now = time_us_32() / 1000;
+            uint32_t click_now = to_ms_since_boot(get_absolute_time());
             kmbox_start_button_click(btn, click_now);
             fast_cmd_count++;
             return true;
@@ -558,6 +612,13 @@ static bool __not_in_flash_func(process_fast_command)(const uint8_t *pkt) {
             return true;
         }
         
+        case FAST_CMD_SET_HUMAN:
+            if (pkt[1] < HUMANIZATION_MODE_COUNT) {
+                smooth_set_humanization_mode((humanization_mode_t)pkt[1]);
+            }
+            return true;
+
+        case FAST_CMD_INFO_REQUEST:
         case FAST_CMD_INFO: {
             uint32_t now_ms = to_ms_since_boot(get_absolute_time());
             int16_t temp = get_cached_temperature(now_ms);
@@ -753,9 +814,9 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
     
     // Echo: E<data>
     if (len >= 2 && line[0] == 'E') {
-        uart_send_string("ECHO:");
-        uart_send_string(line + 1);
-        uart_send_string("\r\n");
+        char response[KMBOX_CMD_BUFFER_SIZE + 8];
+        snprintf(response, sizeof(response), "ECHO:%s", line + 1);
+        kmbox_send_response(response);
         return true;
     }
     
@@ -859,38 +920,57 @@ static bool handle_text_command(const char *line, size_t len, uint32_t now_ms) {
 
 // Parse a complete line from the ring buffer
 static bool parse_text_line(char *buf, size_t bufsize, size_t *out_len) {
+    if (!buf || bufsize < 2 || !out_len) return false;
+    *out_len = 0;
     uint16_t avail = rx_available();
     if (avail == 0) return false;
-    
-    // Scan for line terminator
+
     uint16_t line_end = 0;
-    bool found = false;
-    for (uint16_t i = 0; i < avail && i < bufsize - 1; i++) {
-        uint8_t ch = rx_peek_at(i);
-        if (ch == '\n' || ch == '\r') {
-            line_end = i;
-            found = true;
-            break;
+    while (line_end < avail && rx_peek_at(line_end) != '\n' &&
+           rx_peek_at(line_end) != '\r') line_end++;
+    if (line_end == avail) {
+        if (text_discarding || avail >= bufsize) {
+            // Discard an oversized line until its terminator, across task calls.
+            rx_consume(avail);
+            text_discarding = true;
         }
+        return false;
     }
-    if (!found) return false;
-    
-    // Copy line to buffer
-    for (uint16_t i = 0; i < line_end; i++) {
-        buf[i] = rx_peek_at(i);
+    if (!text_discarding && line_end < bufsize) {
+        if (!rx_copy_peek((uint8_t *)buf, line_end)) return false;
+        buf[line_end] = '\0';
+        *out_len = line_end;
     }
-    buf[line_end] = '\0';
-    *out_len = line_end;
-    
-    // Consume line + terminator(s)
+    text_discarding = false;
     uint16_t consume = line_end + 1;
     if (consume < avail) {
         uint8_t next = rx_peek_at(consume);
-        if (next == '\n' || next == '\r') consume++;  // Handle \r\n
+        if (next == '\n' || next == '\r') consume++;
     }
     rx_consume(consume);
-    
     return true;
+}
+
+static uint16_t process_text_commands(uint32_t now_ms, uint16_t budget) {
+    uint16_t processed = 0;
+    char line[KMBOX_CMD_BUFFER_SIZE];
+    size_t len;
+    while (rx_available() > 0 && processed < budget) {
+        // Recheck after every line: a binary packet may follow text in the same
+        // DMA batch, and its payload may contain CR or LF.
+        uint8_t peek = rx_peek_at(0);
+        if (!text_discarding && (is_fast_cmd_start(peek) || peek == BRIDGE_SYNC_BYTE)) break;
+        if (!parse_text_line(line, sizeof(line), &len)) break;
+        processed++;
+        if (len > 0) {
+            mark_activity(now_ms);
+            if (!handle_text_command(line, len, now_ms)) {
+                kmbox_process_serial_line(line, len, "\n", 1, now_ms);
+            }
+        }
+    }
+
+    return processed;
 }
 
 //--------------------------------------------------------------------+
@@ -907,9 +987,17 @@ void kmbox_serial_init(void) {
     
     // Initialize state
     uart_rx_read_pos = 0;
-    
-    // Initialize TX ring buffer
-    tx_buffer_init(&g_uart_tx_buffer);
+    uart_rx_poll_write_pos = 0;
+    text_discarding = false;
+    uart_rx_reported_epoch = 0;
+    uart_rx_loss_pending = false;
+    memset(&uart_rx_state, 0, sizeof(uart_rx_state));
+
+    // Claim once for firmware lifetime; both USB cores may enqueue status text.
+    if (!tx_lock) tx_lock = spin_lock_init((unsigned)spin_lock_claim_unused(true));
+    tx_head = tx_tail = 0;
+    tx_offset = 0;
+    tx_dma_active = false;
     g_uart_tx_dropped = 0;
     
     g_connection_state = BRIDGE_STATE_WAITING;
@@ -945,6 +1033,7 @@ void kmbox_serial_init(void) {
     
     // Initialize kmbox commands library
     kmbox_commands_init();
+    kmbox_set_output_callback(command_reply_write);
     kmbox_update_states(g_last_data_time_ms);
     
     // Set initial LED
@@ -970,15 +1059,19 @@ void kmbox_serial_init_dma(void) {
     channel_config_set_write_increment(&rx_cfg, true);    // Increment write pointer
     channel_config_set_dreq(&rx_cfg, uart_get_dreq(KMBOX_UART, false));  // RX DREQ
     channel_config_set_ring(&rx_cfg, true, __builtin_ctz(UART_RX_BUFFER_SIZE));  // Ring on write side
+    channel_config_set_irq_quiet(&rx_cfg, true);
     channel_config_set_high_priority(&rx_cfg, true);      // High priority for low latency
     
-    // Start continuous RX DMA - transfers indefinitely into circular buffer
+    dma_rx_init(&uart_rx_state, UART_RX_BUFFER_MASK, uart_rx_read_pos,
+                uart_rx_poll_write_pos, KMBOX_UART_BAUDRATE, time_us_64());
+    uart_rx_state.fifo_status = &uart_get_hw(KMBOX_UART)->fr;
+    // Self-trigger mode exposes byte progress while reloading without CPU rearming.
     dma_channel_configure(
         uart_rx_dma_chan,
         &rx_cfg,
-        uart_rx_buffer,                          // Write to ring buffer
+        uart_rx_buffer + uart_rx_poll_write_pos, // Preserve unread polled bytes
         &uart_get_hw(KMBOX_UART)->dr,           // Read from UART data register
-        0xFFFFFFFF,                              // Transfer "forever"
+        dma_encode_transfer_count_with_self_trigger(DMA_RX_TRANSFER_COUNT),
         true                                     // Start immediately
     );
     
@@ -987,13 +1080,13 @@ void kmbox_serial_init_dma(void) {
     //--------------------------------------------------------------------+
     // DMA TX: Zero-CPU UART transmission
     //--------------------------------------------------------------------+
-    uart_tx_dma_chan = dma_claim_unused_channel(false);
-    if (uart_tx_dma_chan < 0) {
+    int new_tx_dma_chan = dma_claim_unused_channel(false);
+    if (new_tx_dma_chan < 0) {
         printf("[KMBOX] WARNING: Failed to claim TX DMA channel, using IRQ fallback\n");
         return;
     }
     
-    dma_channel_config tx_cfg = dma_channel_get_default_config(uart_tx_dma_chan);
+    dma_channel_config tx_cfg = dma_channel_get_default_config(new_tx_dma_chan);
     channel_config_set_transfer_data_size(&tx_cfg, DMA_SIZE_8);
     channel_config_set_read_increment(&tx_cfg, true);     // Increment through TX buffer
     channel_config_set_write_increment(&tx_cfg, false);    // Always write to UART DR
@@ -1002,25 +1095,44 @@ void kmbox_serial_init_dma(void) {
     
     // Configure channel but don't start yet (will be triggered per-transfer)
     dma_channel_configure(
-        uart_tx_dma_chan,
+        new_tx_dma_chan,
         &tx_cfg,
         &uart_get_hw(KMBOX_UART)->dr,   // Write to UART data register
-        dma_tx_buffer,                   // Read from TX staging buffer (updated per-transfer)
+        NULL,                            // Set from the queued record at submission
         0,                               // Transfer count set per-transfer
         false                            // Don't start yet
     );
     
-    // Set up DMA TX completion interrupt
-    dma_channel_set_irq0_enabled(uart_tx_dma_chan, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, on_dma_tx_complete);
-    irq_set_priority(DMA_IRQ_0, 1);  // High priority (just below UART)
-    irq_set_enabled(DMA_IRQ_0, true);
-    
-    // Disable UART TX IRQ since DMA handles TX now
+    // Switch ownership under the same lock as the IRQ consumer. If a record is
+    // partly written, DMA resumes at tx_offset after the bytes already in FIFO.
+    uint32_t save = spin_lock_blocking(tx_lock);
     uart_set_irq_enables(KMBOX_UART, false, false);
-    g_uart_tx_buffer.tx_active = false;
-    
-    printf("[KMBOX] DMA TX initialized: ch=%d, buf=%u bytes\n", uart_tx_dma_chan, DMA_TX_BUFFER_SIZE);
+    uart_tx_dma_chan = new_tx_dma_chan;
+    tx_service_locked();
+    spin_unlock(tx_lock, save);
+
+}
+
+// Called on Core 0 after RX polling has reported a discontinuity.
+static void rx_handle_loss(void) {
+    if (!uart_rx_loss_pending) return;
+    uart_rx_loss_pending = false;
+    kmbox_set_injected_buttons(0);
+    smooth_clear_queue();
+    if (g_timed_move_alarm_id >= 0) {
+        cancel_alarm(g_timed_move_alarm_id);
+        g_timed_move_alarm_id = -1;
+    }
+    pending_timed_move.pending = false;
+    pending_timed_move.fired = false;
+    if (g_xbox_mode) xbox_inject_clear();
+}
+
+void kmbox_get_rx_loss_stats(uint32_t *overruns, uint64_t *discarded_bytes,
+                            uint32_t *ambiguous_polls) {
+    if (overruns) *overruns = uart_rx_state.overruns;
+    if (discarded_bytes) *discarded_bytes = uart_rx_state.discarded_bytes;
+    if (ambiguous_polls) *ambiguous_polls = uart_rx_state.ambiguous_polls;
 }
 
 //--------------------------------------------------------------------+
@@ -1028,10 +1140,11 @@ void kmbox_serial_init_dma(void) {
 //--------------------------------------------------------------------+
 
 void kmbox_serial_task(void) {
-    // Use cheap microsecond timer — avoid to_ms_since_boot(get_absolute_time())
-    // which has significant overhead.  Convert to ms only when needed.
-    uint32_t now_us = time_us_32();
-    uint32_t now_ms = now_us / 1000;
+    tx_service();
+    rx_handle_loss();
+    // Share the boot-time millisecond clock with click/report processing.
+    // Dividing time_us_32() first would reset this clock every ~71 minutes.
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
     
     // Periodic ping to bridge (every 5 seconds)
     if (now_ms - g_last_ping_time_ms > 5000) {
@@ -1053,6 +1166,7 @@ void kmbox_serial_task(void) {
     const uint16_t MAX_PACKETS_PER_CALL = 64;
     
     while (rx_available() > 0 && packets_processed < MAX_PACKETS_PER_CALL) {
+        if (text_discarding) break;
         uint8_t first = rx_peek_at(0);
         
         //--------------------------------------------------------------
@@ -1064,18 +1178,8 @@ void kmbox_serial_task(void) {
             
             uint8_t pkt[8];
             size_t copy = (avail < 8) ? avail : 8;
-            // Optimized peek - use memcpy if data is contiguous
-            uint16_t tail = (uint16_t)(uart_rx_read_pos & UART_RX_BUFFER_MASK);
-            uint16_t first_chunk = UART_RX_BUFFER_SIZE - tail;
-            if (first_chunk >= copy) {
-                // Data is contiguous, use fast memcpy
-                memcpy(pkt, &uart_rx_buffer[tail], copy);
-            } else {
-                // Data wraps around, copy in two chunks
-                memcpy(pkt, &uart_rx_buffer[tail], first_chunk);
-                memcpy(pkt + first_chunk, uart_rx_buffer, copy - first_chunk);
-            }
-            
+            if (!rx_copy_peek(pkt, copy)) break;
+
             uint8_t consumed = process_bridge_packet(pkt, copy);
             if (consumed >= 2) {
                 rx_consume(consumed);
@@ -1090,24 +1194,13 @@ void kmbox_serial_task(void) {
         }
         
         //--------------------------------------------------------------
-        // Fast binary commands — zero-copy when data is contiguous
+        // Fast binary commands — copy and validate before executing.
         //--------------------------------------------------------------
         if (is_fast_cmd_start(first)) {
             if (rx_available() >= 8) {
-                uint16_t tail = (uint16_t)(uart_rx_read_pos & UART_RX_BUFFER_MASK);
-                const uint8_t *pkt;
-                uint8_t pkt_stack[8];
-                
-                // Zero-copy: if all 8 bytes are contiguous in the circular buffer,
-                // pass a pointer directly into the DMA buffer (no memcpy)
-                if (tail + 8 <= UART_RX_BUFFER_SIZE) {
-                    pkt = &uart_rx_buffer[tail];
-                } else {
-                    // Wraps around — must copy to stack (rare at 512-byte buffer)
-                    for (int i = 0; i < 8; i++) pkt_stack[i] = rx_peek_at(i);
-                    pkt = pkt_stack;
-                }
-                
+                uint8_t pkt[8];
+                if (!rx_copy_peek(pkt, sizeof(pkt))) break;
+
                 rx_consume(8);
                 process_fast_command(pkt);
                 mark_activity(now_ms);
@@ -1148,27 +1241,12 @@ void kmbox_serial_task(void) {
     // packet.  The remaining bytes arrive within ~27µs at 3 Mbaud, so the
     // next kmbox_serial_task() call will process the completed packet.
     //------------------------------------------------------------------
-    bool buffer_starts_with_binary = false;
-    if (rx_available() > 0) {
-        uint8_t peek = rx_peek_at(0);
-        buffer_starts_with_binary = is_fast_cmd_start(peek) ||
-                                    peek == BRIDGE_SYNC_BYTE;
-    }
+    packets_processed += process_text_commands(now_ms, MAX_PACKETS_PER_CALL - packets_processed);
 
-    char line[KMBOX_CMD_BUFFER_SIZE];
-    size_t len;
-    while (!buffer_starts_with_binary && parse_text_line(line, sizeof(line), &len)) {
-        if (len > 0) {
-            mark_activity(now_ms);
-            if (!handle_text_command(line, len, now_ms)) {
-                // Pass to kmbox library for additional parsing
-                kmbox_process_serial_line(line, len, "\n", 1, now_ms);
-            }
-        }
-    }
-    
+    rx_handle_loss();
     // Update button states
     kmbox_update_states(now_ms);
+    tx_service();
 }
 
 //--------------------------------------------------------------------+

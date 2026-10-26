@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <ctype.h>
+#include <limits.h>
 
 // Persistent button state — buttons are sticky (press stays until release)
 static uint8_t g_button_state = 0;
@@ -41,12 +42,15 @@ static bool parse_int(const char **p, int32_t *out) {
 
     if (!isdigit((unsigned char)**p)) return false;
 
-    int32_t val = 0;
+    uint32_t val = 0;
+    uint32_t limit = (uint32_t)INT32_MAX + (neg ? 1u : 0u);
     while (isdigit((unsigned char)**p)) {
-        val = val * 10 + (**p - '0');
+        uint32_t digit = (uint32_t)(**p - '0');
+        if (val > (limit - digit) / 10u) return false;
+        val = val * 10u + digit;
         (*p)++;
     }
-    *out = neg ? -val : val;
+    *out = neg ? (val == (uint32_t)INT32_MAX + 1u ? INT32_MIN : -(int32_t)val) : (int32_t)val;
     return true;
 }
 
@@ -74,7 +78,13 @@ static void emit_button_packet(ferrum_translated_t *out, uint8_t mask, bool pres
 // ============================================================================
 
 bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *out) {
-    if (!line || len == 0 || !out) return false;
+    if (!line || len == 0 || len >= FERRUM_MAX_LINE || !out) return false;
+
+    // Respect the supplied span; callers need not provide a trailing NUL.
+    char bounded_line[FERRUM_MAX_LINE];
+    memcpy(bounded_line, line, len);
+    bounded_line[len] = '\0';
+    line = bounded_line;
 
     memset(out, 0, sizeof(ferrum_translated_t));
 
@@ -94,7 +104,8 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
         if (!parse_int(&p, &x)) return false;
         skip_separator(&p);
         if (!parse_int(&p, &y)) return false;
-        if (*p != ')') return false;
+        if (*p != ')' || x < INT16_MIN || x > INT16_MAX ||
+            y < INT16_MIN || y > INT16_MAX) return false;
 
         // Direct accumulator (0x01) — the coalescer in main.c intercepts
         // move packets and re-routes through smooth queue (0x07) at a
@@ -113,7 +124,7 @@ bool ferrum_translate_line(const char *line, size_t len, ferrum_translated_t *ou
 
         int32_t wheel;
         if (!parse_int(&p, &wheel)) return false;
-        if (*p != ')') return false;
+        if (*p != ')' || wheel < INT8_MIN || wheel > INT8_MAX) return false;
 
         out->length = (uint16_t)fast_build_mouse_move(
             out->buffer, 0, 0, g_button_state, (int8_t)wheel);

@@ -35,6 +35,8 @@
 #define FAST_CMD_KEY_PRESS      0x0C    // Single key press (alias for KEY_COMBO)
 #define FAST_CMD_INFO           0x0D    // Request system info
 #define FAST_CMD_INFO_EXT       0x0E    // Request extended stats
+#define FAST_CMD_SET_HUMAN      0x10    // [cmd][mode][pad*6], mode 0..2
+#define FAST_CMD_INFO_REQUEST   0x11    // Text-safe request; response remains FAST_CMD_INFO
 #define FAST_CMD_CYCLE_HUMAN    0x0F    // Cycle humanization mode
 #define FAST_CMD_XBOX_INPUT     0x20    // Xbox gamepad: buttons + triggers
 #define FAST_CMD_XBOX_STICK_L   0x22    // Xbox left stick X/Y
@@ -190,6 +192,28 @@ static inline size_t fast_build_mouse_click(uint8_t *buf, uint8_t button, uint8_
     buf[5] = 0;
     buf[6] = 0;
     buf[7] = 0;
+    return FAST_CMD_PACKET_SIZE;
+}
+
+// Shared builders for fixed-size control packets.
+static inline size_t fast_build_ping(uint8_t *buf) {
+    memset(buf, 0, FAST_CMD_PACKET_SIZE);
+    buf[0] = FAST_CMD_PING;
+    return FAST_CMD_PACKET_SIZE;
+}
+
+static inline size_t fast_build_set_human(uint8_t *buf, uint8_t mode) {
+    memset(buf, 0, FAST_CMD_PACKET_SIZE);
+    buf[0] = FAST_CMD_SET_HUMAN;
+    buf[1] = mode;
+    return FAST_CMD_PACKET_SIZE;
+}
+
+static inline size_t fast_build_smooth_config(uint8_t *buf, uint8_t max_per_frame, uint8_t vel_match) {
+    memset(buf, 0, FAST_CMD_PACKET_SIZE);
+    buf[0] = FAST_CMD_SMOOTH_CONFIG;
+    buf[1] = max_per_frame;
+    buf[2] = vel_match;
     return FAST_CMD_PACKET_SIZE;
 }
 

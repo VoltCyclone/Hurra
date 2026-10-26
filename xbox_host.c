@@ -64,9 +64,9 @@ static uint8_t pending_out_len;
 static bool power_on_pending;
 
 // Spinlock numbers for shared state (claim unique IDs from Pico SDK pool)
-#define XBOX_SPINLOCK_GAMEPAD   24
-#define XBOX_SPINLOCK_H2D_QUEUE 25
-#define XBOX_SPINLOCK_D2H_QUEUE 26
+static int gamepad_lock_num = -1;
+static int h2d_lock_num = -1;
+static int d2h_lock_num = -1;
 
 //--------------------------------------------------------------------+
 // Forward Declarations
@@ -84,9 +84,13 @@ static bool xbox_host_driver_init(void) {
     pending_out_len = 0;
     power_on_pending = false;
     memset(&gamepad_state, 0, sizeof(gamepad_state));
-    gamepad_state.lock = spin_lock_instance(XBOX_SPINLOCK_GAMEPAD);
-    gip_queue_init(&host_to_device_queue, XBOX_SPINLOCK_H2D_QUEUE);
-    gip_queue_init(&device_to_host_queue, XBOX_SPINLOCK_D2H_QUEUE);
+    // Firmware-lifetime claims survive USB stack reinitialization.
+    if (gamepad_lock_num < 0) gamepad_lock_num = spin_lock_claim_unused(true);
+    if (h2d_lock_num < 0) h2d_lock_num = spin_lock_claim_unused(true);
+    if (d2h_lock_num < 0) d2h_lock_num = spin_lock_claim_unused(true);
+    gamepad_state.lock = spin_lock_init((unsigned)gamepad_lock_num);
+    gip_queue_init(&host_to_device_queue, (unsigned)h2d_lock_num);
+    gip_queue_init(&device_to_host_queue, (unsigned)d2h_lock_num);
     return true;
 }
 
