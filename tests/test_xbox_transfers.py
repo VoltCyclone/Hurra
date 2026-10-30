@@ -27,12 +27,16 @@ def function(file, name):
 gip = re.sub(r'^#include "pico/sync.h"$', '', (ROOT / 'xbox_gip.h').read_text(), flags=re.M)
 prefix = r'''
 #include <assert.h>
+#include <assert.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 typedef int spin_lock_t;
-static spin_lock_t lock;
-static spin_lock_t *spin_lock_instance(unsigned n) { (void)n; return &lock; }
+static spin_lock_t locks[32];
+static unsigned claim_count;
+static int spin_lock_claim_unused(bool required) { assert(required); return 24 + claim_count++; }
+static spin_lock_t *spin_lock_init(unsigned n) { assert(n < 32); return &locks[n]; }
+static spin_lock_t *spin_lock_instance(unsigned n) {return spin_lock_init(n);}
 static uint32_t spin_lock_blocking(spin_lock_t *p) { (void)p; return 0; }
 static void spin_unlock(spin_lock_t *p, uint32_t s) { (void)p; (void)s; }
 #define __not_in_flash_func(x) x
@@ -114,8 +118,27 @@ int main(void) {
     assert(pending_in_len == 0 && retained == proxy_in_buf && retained[2] == 9);
 }
 '''
+ownership_state = r'''
+static uint8_t pending_out_len;
+static bool power_on_pending;
+static xbox_gamepad_state_t gamepad_state;
+static gip_packet_queue_t host_to_device_queue, device_to_host_queue;
+static int gamepad_lock_num = -1, h2d_lock_num = -1, d2h_lock_num = -1;
+'''
+ownership_test = r'''
+int main(void) {
+    assert(xbox_host_driver_init());
+    assert(claim_count == 3);
+    assert(gamepad_state.lock != host_to_device_queue.lock);
+    assert(host_to_device_queue.lock != device_to_host_queue.lock);
+    assert(gamepad_state.lock != device_to_host_queue.lock);
+    assert(xbox_host_driver_init());
+    assert(claim_count == 3);
+}
+'''
 with tempfile.TemporaryDirectory() as temp:
     for name, code in {
+        'ownership': prefix + gip + ownership_state + function('xbox_host.c', 'xbox_host_driver_init') + ownership_test,
         'host': prefix + gip + mock + '\n'.join(function('xbox_host.c', f) for f in
             ['xbox_host_send_power_on', 'xbox_host_send_keepalive', 'xbox_host_task']) + host_test,
         'strings': prefix + device_state + function('xbox_device.c', 'xbox_get_string_descriptor') + device_test,

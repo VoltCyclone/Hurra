@@ -163,10 +163,9 @@ static inline int fast_isqrt(int v) {
 //
 // Architecture:
 //   Main loop calls tft_display_submit_stats() to copy stats into shared buf.
-//   A repeating hardware timer fires every 100ms, picks up the latest stats,
-//   formats strings, and draws into the tft_input framebuffer.
-//   Main loop calls tft_display_flush() which does tft_swap_sync() (SPI DMA)
-//   only when a new frame has been rendered.
+//   A repeating hardware timer marks rendering due every 100ms.
+//   The main loop formats/draws the latest stats and advances one row of SPI
+//   DMA per flush call. No rendering runs in IRQ context.
 // ============================================================================
 
 static bool initialized = false;
@@ -219,12 +218,14 @@ static bool    menu_values_initialized = false;
 static int8_t  menu_highlight_item = -1;  // Item being highlighted (-1 = none)
 static uint32_t menu_highlight_time = 0;  // When highlight started
 
-// Double-buffered stats: main loop writes, timer ISR reads
+// Latest stats are submitted and rendered by the main loop.
 static tft_stats_t shared_stats;           // Latest stats from main loop
-static volatile bool stats_pending = false; // Main loop set, timer clears
+static bool stats_pending = false; // Main loop sets and clears
 
-// Frame ready flag: timer ISR sets after drawing, main loop clears after DMA
-static volatile bool frame_ready = false;
+// Hold the rendered frame until its asynchronous DMA transfer completes.
+static bool frame_ready = false;
+static volatile bool render_due = false;
+static bool transfer_pending = false;
 
 // Stats hash for frame-skip optimization: skip render if stats unchanged
 static uint32_t last_stats_hash = 0;
@@ -1551,8 +1552,12 @@ static void draw_menu_view(const tft_stats_t *stats) {
 // Public API
 // ============================================================================
 
-// Forward declaration — timer callback defined below
-static bool tft_render_timer_callback(repeating_timer_t *rt);
+// Keep alarm IRQ work bounded. Formatting and drawing run in the main loop.
+static bool tft_render_timer_callback(repeating_timer_t *rt) {
+    (void)rt;
+    render_due = true;
+    return true;
+}
 
 bool tft_display_init(void) {
     if (initialized) return true;
@@ -1590,26 +1595,23 @@ bool tft_display_init(void) {
 }
 
 // ============================================================================
-// Timer callback — fires every 100ms from hardware alarm IRQ
-// Does all CPU-intensive work: formatting + drawing into framebuffer.
-// Does NOT touch SPI/DMA (that stays on the main loop via flush).
+// Main-loop rendering, scheduled by the lightweight alarm callback.
 // ============================================================================
 
-static bool tft_render_timer_callback(repeating_timer_t *rt) {
-    (void)rt;
-    if (!initialized) return true;
+static void tft_render_frame(void) {
+    if (!initialized) return;
     
     // Skip if the previous frame hasn't been flushed yet
-    if (frame_ready) return true;
+    if (frame_ready) return;
     
-    // Grab latest stats (atomic-enough: single-word flag guard)
-    if (!stats_pending) return true;
+    // Stats submission and rendering both run on the main loop.
+    if (!stats_pending) return;
     tft_stats_t local_stats = shared_stats;  // Snapshot
     stats_pending = false;
 
     // Skip render if stats haven't meaningfully changed (saves CPU in steady state)
     uint32_t h = stats_quick_hash(&local_stats);
-    if (h == last_stats_hash && menu_highlight_item < 0) return true;
+    if (h == last_stats_hash && menu_highlight_item < 0) return;
     last_stats_hash = h;
 
     // Render into the back buffer
@@ -1632,7 +1634,7 @@ static bool tft_render_timer_callback(repeating_timer_t *rt) {
     
     // Signal main loop that a frame is ready for DMA
     frame_ready = true;
-    return true;  // Keep timer running
+    return;
 }
 
 // ============================================================================
@@ -1640,20 +1642,27 @@ static bool tft_render_timer_callback(repeating_timer_t *rt) {
 // ============================================================================
 
 void tft_display_submit_stats(const tft_stats_t *stats) {
-    // Copy stats into shared buffer — called from main loop.
-    // The timer ISR will pick these up on its next tick.
+    // Keep the latest snapshot for the next main-loop render.
     shared_stats = *stats;
     stats_pending = true;
 }
 
 bool tft_display_flush(void) {
-    // If the timer ISR has rendered a new frame, push it to the display.
-    // This does the SPI DMA transfer (must run on Core0, not in ISR).
-    if (!initialized || !frame_ready) return false;
-    
-    tft_swap_sync();
-    frame_ready = false;
-    return true;
+    if (!initialized) return false;
+    if (transfer_pending) {
+        if (!tft_sync_poll()) return false;
+        transfer_pending = false;
+        frame_ready = false;
+        return true;
+    }
+    if (render_due && !frame_ready) {
+        render_due = false;
+        tft_render_frame();
+    }
+    if (!frame_ready) return false;
+    tft_swap_buffers();
+    transfer_pending = tft_sync_start();
+    return false;
 }
 
 void tft_display_update(const tft_stats_t *stats) {
@@ -1686,6 +1695,7 @@ void tft_display_refresh(const tft_stats_t *stats) {
     last_tx_bytes = stats->tx_bytes;
     last_rx_bytes = stats->rx_bytes;
     frame_ready = false;
+    transfer_pending = false;
 }
 
 void tft_display_splash(void) {

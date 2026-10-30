@@ -472,6 +472,56 @@ RaspberryKMBox/
 
 Append `clean` to force a rebuild: `./build.sh all clean`
 
+### Host Regression Checks
+
+These checks need Python 3 and a C compiler with address and undefined-behavior
+sanitizers. They run production functions against mocked peripherals; they do
+not replace firmware builds or testing on the boards.
+
+```bash
+python3 tests/test_xbox_transfers.py
+python3 tests/test_bridge_parsers.py
+python3 tests/test_uart_timing.py
+python3 tests/test_display_io.py
+python3 tests/test_bridge_protocol.py
+python3 tests/test_proxy_tx.py
+python3 tests/test_proxy_rx.py
+python3 tests/test_dma_rx.py
+```
+
+Build and flash the bridge and proxy from the same revision. Both bridge targets
+use eight-byte fast packets. Humanization configuration uses opcode `0x10`, and
+info requests use `0x11` to avoid the carriage-return opcode `0x0D`; info replies
+retain `0x0D`. The variable-length wire-protocol library is not the proxy's UART
+parser and must not be mixed into that stream.
+
+The default software TFT path advances refreshes one DMA row per main-loop pass.
+Rendering runs in the main loop, while the timer interrupt only schedules it.
+The optional `TFT_HW_ACCEL` path and explicit splash/error refreshes remain
+synchronous.
+
+The proxy's protocol UART has stdio disabled. Command replies use an explicit
+output callback into a shared record queue; debug `printf` calls do not write
+onto that UART. The queue supports seven pending records of up to 256 bytes,
+including any CRLF suffix. A full queue rejects whole records and accounts for
+their bytes in `kmbox_get_tx_dropped_bytes()`. Startup and DMA-allocation failure
+use polled RX and IRQ TX, preserving pending data when DMA starts.
+
+DMA RX on both boards uses RP2350 self-trigger mode with a decrementing count,
+so complete ring-buffer laps cannot appear empty. Copies are checked against a
+second coherent count/address snapshot before delivery. A loss discards pending
+input and partial parser state; the proxy also releases injected controls and
+cancels queued/timed movement. Reception resumes after at least 1 ms without DMA
+progress and an empty UART FIFO. The sender must provide that gap at a packet
+boundary; continuous traffic is discarded during recovery.
+
+The bridge exposes overrun events through `hw_uart_get_stats()` and discarded
+bytes/ambiguous polls through `hw_uart_get_rx_loss_stats()`. The proxy exposes
+all three through `kmbox_get_rx_loss_stats()` on Core 0. If a scheduling pause
+could hide an entire hardware count period, reception fails closed and the byte
+count is a lower bound. These counters describe discarded data, not retransmission
+or flow control. No additional DMA channels or RX interrupts are required.
+
 ### Build Configuration
 
 Presets defined in `defines.h`:

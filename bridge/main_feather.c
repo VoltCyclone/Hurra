@@ -5,7 +5,7 @@
  * No TFT, no tracker, no Makcu. Just CDC -> Wire Protocol -> KMBox.
  *
  * Architecture:
- *   PC (km.move text) -> USB CDC -> Feather RP2350 -> UART0 (wire_protocol) -> KMBox
+ *   PC (km.move text) -> USB CDC -> Feather RP2350 -> UART0 (fixed-size fast protocol) -> KMBox
  *
  * Wiring:
  *   Feather GPIO 0 (UART0 TX) -> KMBox GPIO 9 (UART1 RX)
@@ -28,7 +28,7 @@
 #include "ferrum_protocol.h"
 #include "ferrum_translator.h"
 #include "neopixel_dma.h"
-#include "wire_protocol.h"
+#include "fast_commands.h"
 #include "kmbox_commands.h"
 #include "input_classifier.h"
 
@@ -67,21 +67,21 @@ static uint8_t cmd_buffer_idx = 0;
 // UART Helpers
 // ============================================================================
 
-static inline bool send_wire_packet(const uint8_t *data, size_t len) {
+static inline bool send_fast_packet(const uint8_t *data, size_t len) {
     return hw_uart_send(data, len);
 }
 
 // ============================================================================
-// CDC RX Task — Parse Ferrum and KMBox text, emit wire protocol
+// CDC RX Task — Parse Ferrum and KMBox text, emit fixed-size fast packets
 // ============================================================================
 
 static void handle_text_command(const char *cmd) {
     int x, y;
     if (kmbox_parse_move_command(cmd, &x, &y)) {
         input_classifier_record_move((int16_t)x, (int16_t)y);
-        uint8_t pkt[WIRE_MAX_PACKET];
-        size_t len = wire_build_move(pkt, (int16_t)x, (int16_t)y);
-        send_wire_packet(pkt, len);
+        uint8_t pkt[FAST_CMD_PACKET_SIZE];
+        size_t len = fast_build_mouse_move(pkt, (int16_t)x, (int16_t)y, 0, 0);
+        send_fast_packet(pkt, len);
         return;
     }
 
@@ -118,15 +118,13 @@ static void cdc_rx_task(void) {
                 ferrum_translated_t translated;
                 if (ferrum_translate_line(ferrum_line, ferrum_idx, &translated)) {
                     if (translated.length > 0) {
-                        if (translated.buffer[0] == WIRE_MOVE8 && translated.length >= 3) {
-                            input_classifier_record_move((int8_t)translated.buffer[1],
-                                                         (int8_t)translated.buffer[2]);
-                        } else if (translated.buffer[0] == WIRE_MOVE16 && translated.length >= 5) {
+                        if (translated.buffer[0] == FAST_CMD_MOUSE_MOVE &&
+                            translated.length == FAST_CMD_PACKET_SIZE) {
                             int16_t mx = (int16_t)(translated.buffer[1] | (translated.buffer[2] << 8));
                             int16_t my = (int16_t)(translated.buffer[3] | (translated.buffer[4] << 8));
                             input_classifier_record_move(mx, my);
                         }
-                        send_wire_packet(translated.buffer, translated.length);
+                        send_fast_packet(translated.buffer, translated.length);
                     }
                     if (translated.needs_response && tud_cdc_connected()) {
                         const char *resp = FERRUM_RESPONSE;
@@ -186,60 +184,55 @@ static void cdc_rx_task(void) {
 }
 
 // ============================================================================
-// UART RX Task — Read wire protocol responses from KMBox
+// UART RX Task — Read fixed-size responses from KMBox
 // ============================================================================
 
 static void uart_rx_task(void) {
+    // Keep parser state across DMA reads; a UART packet need not arrive in one batch.
+    static uint8_t packet[FAST_CMD_PACKET_SIZE];
+    static uint8_t packet_idx;
+    static char line[128];
+    static size_t line_len;
+    static uint32_t packet_started_ms;
     uint8_t batch[128];
     size_t n = hw_uart_read(batch, sizeof(batch));
-    if (n == 0) return;
-
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    kmbox_last_rx_time = now;
-
-    if (bridge_conn_state == BRIDGE_DISCONNECTED) {
-        bridge_conn_state = BRIDGE_CONNECTED;
+    if (hw_uart_rx_take_loss()) {
+        packet_idx = 0;
+        line_len = 0;
     }
-
-    // Process wire protocol responses
-    size_t pos = 0;
-    while (pos < n) {
-        uint8_t first = batch[pos];
-        uint8_t pkt_len = wire_get_packet_len(first);
-
-        if (pkt_len > 0 && pos + pkt_len <= n) {
-            // Wire protocol response — forward key info to CDC debug
-            if (first == WIRE_RESPONSE && pkt_len == 6) {
-                uint8_t status = batch[pos + 1];
-                if (status == WIRE_RESP_INFO) {
-                    // Info response: [0xFF][0x0C][hmode][imode][max_pf][queue]
-                    // Could log or display via NeoPixel
-                }
+    if (n == 0) return;
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (packet_idx && now - packet_started_ms > 100) packet_idx = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = batch[i];
+        if (packet_idx) {
+            packet[packet_idx++] = c;
+            if (packet_idx == sizeof(packet)) {
+                packet_idx = 0;
+                kmbox_last_rx_time = now;
+                bridge_conn_state = BRIDGE_CONNECTED;
             }
-            pos += pkt_len;
             continue;
         }
-
-        // Text response from KMBox (KMBOX_PONG, etc.)
-        // Forward to CDC for debugging
-        if (first >= 0x20 && first <= 0x7E) {
-            // Find line end
-            size_t line_start = pos;
-            while (pos < n && batch[pos] != '\n' && batch[pos] != '\r') pos++;
-            if (pos < n) {
-                // Forward text response to CDC
+        // Feather only requests ping replies. Other bytes are text, including CR/LF.
+        if (c == FAST_CMD_RESPONSE || c == FAST_CMD_PING) {
+            packet_idx = 1;
+            packet[0] = c;
+            packet_started_ms = now;
+        } else if (c == '\r' || c == '\n') {
+            if (line_len) {
+                kmbox_last_rx_time = now;
+                bridge_conn_state = BRIDGE_CONNECTED;
                 if (tud_cdc_connected()) {
-                    tud_cdc_write(&batch[line_start], pos - line_start);
+                    tud_cdc_write(line, line_len);
                     tud_cdc_write_str("\r\n");
                     tud_cdc_write_flush();
                 }
-                while (pos < n && (batch[pos] == '\n' || batch[pos] == '\r')) pos++;
+                line_len = 0;
             }
-            continue;
+        } else if (c >= 0x20 && c <= 0x7E && line_len < sizeof(line)) {
+            line[line_len++] = (char)c;
         }
-
-        // Skip unknown byte
-        pos++;
     }
 }
 
@@ -259,9 +252,9 @@ static void connection_task(void) {
     // Periodic ping
     if (now - kmbox_last_ping_time >= KMBOX_PING_INTERVAL_MS) {
         kmbox_last_ping_time = now;
-        uint8_t pkt[1];
-        wire_build_ping(pkt);
-        send_wire_packet(pkt, 1);
+        uint8_t pkt[FAST_CMD_PACKET_SIZE];
+        fast_build_ping(pkt);
+        send_fast_packet(pkt, sizeof(pkt));
     }
 
     // Evaluate input classification (~1Hz)
@@ -274,10 +267,9 @@ static void connection_task(void) {
             if (cls != INPUT_UNKNOWN && cls != last_sent_class &&
                 bridge_conn_state == BRIDGE_CONNECTED) {
                 uint8_t hmode = (cls == INPUT_PRE_HUMANIZED) ? 1 : 2;
-                uint8_t cfg[3];
-                wire_build_config(cfg, WIRE_CFG_HUMANIZATION, hmode);
-                send_wire_packet(cfg, 3);
-                last_sent_class = cls;
+                uint8_t cfg[FAST_CMD_PACKET_SIZE];
+                fast_build_set_human(cfg, hmode);
+                if (send_fast_packet(cfg, sizeof(cfg))) last_sent_class = cls;
                 printf("[Bridge] Auto-detected input: %s -> humanization %s\n",
                        cls == INPUT_PRE_HUMANIZED ? "pre-humanized" : "raw",
                        hmode == 1 ? "MICRO" : "FULL");

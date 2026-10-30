@@ -13,7 +13,6 @@
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
 #include "hardware/dma.h"
-#include "hardware/irq.h"
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
 #include "hardware/structs/uart.h"
@@ -27,30 +26,20 @@
 static int tx_dma_chan = -1;
 static int rx_dma_chan = -1;
 
-// TX double-buffer for continuous transmission
-static uint8_t tx_buffer_a[HW_UART_TX_BUFFER_SIZE] __attribute__((aligned(4)));
-static uint8_t tx_buffer_b[HW_UART_TX_BUFFER_SIZE] __attribute__((aligned(4)));
-static volatile bool using_buffer_a = true;
-static volatile bool tx_busy = false;
+// One staging buffer is sufficient: it is only reused after DMA is idle.
+static uint8_t tx_buffer[HW_UART_TX_BUFFER_SIZE] __attribute__((aligned(4)));
 
 // RX circular buffer (must be aligned to size for DMA ring mode)
 static uint8_t rx_buffer[HW_UART_RX_BUFFER_SIZE] __attribute__((aligned(HW_UART_RX_BUFFER_SIZE)));
-static volatile uint32_t rx_read_pos = 0;
+static dma_rx_state_t rx_state;
+static uint32_t rx_reported_loss_epoch;
 
 // Statistics
 static volatile uint32_t total_tx_bytes = 0;
 static volatile uint32_t total_rx_bytes = 0;
-static volatile uint32_t rx_overflows = 0;
-
-// IRQ handler for TX DMA completion
-static void tx_dma_irq_handler(void) {
-    if (tx_dma_chan >= 0 && dma_channel_get_irq0_status(tx_dma_chan)) {
-        dma_channel_acknowledge_irq0(tx_dma_chan);
-        tx_busy = false;
-    }
-}
 
 bool hw_uart_init(uint tx_pin, uint rx_pin, uint baud) {
+    if (baud == 0) return false;
     // NOTE: We intentionally skip peri_clock_configure_stable() here.
     // 3Mbaud divides exactly from 240MHz (div=5), and keeping clk_peri
     // at 240MHz gives the TFT SPI bus 40MHz instead of 24MHz.
@@ -69,7 +58,7 @@ bool hw_uart_init(uint tx_pin, uint rx_pin, uint baud) {
     uint actual_baud = uart_init(HW_UART, baud);
     
     // Calculate and display baud rate accuracy
-    int32_t baud_error_ppm = ((int32_t)actual_baud - (int32_t)baud) * 1000000 / (int32_t)baud;
+    int32_t baud_error_ppm = (int32_t)(((int64_t)actual_baud - baud) * 1000000 / baud);
     printf("[HW_UART] Requested: %u, Actual: %u, Error: %ld ppm\n", baud, actual_baud, baud_error_ppm);
     
     // Warn if baud rate error is too high (>2% is problematic)
@@ -116,11 +105,9 @@ bool hw_uart_init(uint tx_pin, uint rx_pin, uint baud) {
         false
     );
     
-    // Set up TX DMA interrupt
-    dma_channel_set_irq0_enabled(tx_dma_chan, true);
-    irq_set_exclusive_handler(DMA_IRQ_0, tx_dma_irq_handler);
-    irq_set_enabled(DMA_IRQ_0, true);
-    
+    // TX completion is polled from the DMA BUSY bit. No per-packet IRQ or
+    // software flag is needed, and a delayed IRQ cannot mark a new TX idle.
+
     // Claim RX DMA channel
     rx_dma_chan = dma_claim_unused_channel(false);
     if (rx_dma_chan < 0) {
@@ -141,6 +128,7 @@ bool hw_uart_init(uint tx_pin, uint rx_pin, uint baud) {
     
     uint ring_size_bits = __builtin_ctz(HW_UART_RX_BUFFER_SIZE);
     channel_config_set_ring(&rx_cfg, true, ring_size_bits);
+    channel_config_set_irq_quiet(&rx_cfg, true);
     channel_config_set_high_priority(&rx_cfg, true);
     
     printf("[HW_UART] RX DMA: ch=%d dreq=%u ring_bits=%u buf_size=%u\n", 
@@ -149,13 +137,16 @@ bool hw_uart_init(uint tx_pin, uint rx_pin, uint baud) {
     // Print UART hardware register addresses for debugging
     printf("[HW_UART] UART base=%p DR=%p\n", uart_hw, &uart_hw->dr);
     
-    // Start continuous RX DMA
+    dma_rx_init(&rx_state, HW_UART_RX_BUFFER_SIZE - 1, 0, 0, actual_baud, time_us_64());
+    rx_state.fifo_status = &uart_hw->fr;
+    rx_reported_loss_epoch = 0;
+    // Self-triggered count reloads preserve continuous reception and expose progress.
     dma_channel_configure(
         rx_dma_chan,
         &rx_cfg,
         rx_buffer,
         &uart_hw->dr,  // Read from UART data register
-        0xFFFFFFFF,
+        dma_encode_transfer_count_with_self_trigger(DMA_RX_TRANSFER_COUNT),
         true
     );
     
@@ -171,7 +162,7 @@ bool hw_uart_init(uint tx_pin, uint rx_pin, uint baud) {
 }
 
 bool hw_uart_send(const uint8_t *data, size_t len) {
-    if (len == 0 || len > HW_UART_TX_BUFFER_SIZE) {
+    if (!data || len == 0 || len > HW_UART_TX_BUFFER_SIZE) {
         return false;
     }
     
@@ -183,23 +174,10 @@ bool hw_uart_send(const uint8_t *data, size_t len) {
         return true;
     }
     
-    // Non-blocking: if DMA is still busy, copy to the other buffer
-    // and return false so caller knows to retry or drop
-    if (tx_busy) {
-        // Check if DMA actually finished (IRQ may be delayed)
-        if (!dma_channel_is_busy(tx_dma_chan)) {
-            tx_busy = false;
-        } else {
-            return false;  // Non-blocking: DMA still active, caller should retry
-        }
-    }
-    
-    uint8_t *buf = using_buffer_a ? tx_buffer_a : tx_buffer_b;
-    memcpy(buf, data, len);
-    using_buffer_a = !using_buffer_a;
-    
-    tx_busy = true;
-    dma_channel_set_read_addr(tx_dma_chan, buf, false);
+    if (dma_channel_is_busy(tx_dma_chan)) return false;
+
+    memcpy(tx_buffer, data, len);
+    dma_channel_set_read_addr(tx_dma_chan, tx_buffer, false);
     dma_channel_set_trans_count(tx_dma_chan, len, true);
     
     total_tx_bytes += len;
@@ -207,69 +185,57 @@ bool hw_uart_send(const uint8_t *data, size_t len) {
 }
 
 void hw_uart_putc(uint8_t c) {
-    // Non-blocking with brief spin (max ~10µs at 2Mbaud)
-    uint32_t timeout = 100;  // ~100 iterations
-    while (!uart_is_writable(HW_UART) && --timeout) {
-        tight_loop_contents();
-    }
-    if (timeout) {
-        uart_putc_raw(HW_UART, c);
-        total_tx_bytes++;
-    }
+    // Control text must follow queued binary DMA data, never interleave with it.
+    hw_uart_tx_wait();
+    uart_putc_raw(HW_UART, c);
+    total_tx_bytes++;
 }
 
 void hw_uart_puts(const char *str) {
+    if (!str) return;
+    hw_uart_tx_wait();
     size_t len = strlen(str);
-    if (len <= HW_UART_TX_BUFFER_SIZE) {
-        hw_uart_send((const uint8_t *)str, len);
-    } else {
-        while (*str) {
-            hw_uart_putc(*str++);
-        }
-    }
-}
-
-#define RX_MASK (HW_UART_RX_BUFFER_SIZE - 1)
-
-static inline uint32_t get_rx_write_pos(void) {
-    return dma_ring_write_pos(rx_dma_chan, rx_buffer, RX_MASK);
+    uart_write_blocking(HW_UART, (const uint8_t *)str, len);
+    total_tx_bytes += len;
 }
 
 bool hw_uart_rx_available(void) {
-    return dma_ring_available(rx_read_pos, get_rx_write_pos(), RX_MASK) > 0;
+    return hw_uart_rx_count() > 0;
 }
 
 size_t hw_uart_rx_count(void) {
-    uint32_t avail = dma_ring_available(rx_read_pos, get_rx_write_pos(), RX_MASK);
-    if (avail >= HW_UART_RX_BUFFER_SIZE - 16) {
-        rx_overflows++;
-    }
-    return avail;
+    return rx_dma_chan < 0 ? 0 : dma_rx_poll(&rx_state, rx_dma_chan);
 }
 
 int hw_uart_getc(void) {
-    if (!hw_uart_rx_available()) return -1;
-
-    uint8_t c = rx_buffer[rx_read_pos];
-    rx_read_pos = (rx_read_pos + 1) & RX_MASK;
-    total_rx_bytes++;
-    return c;
+    uint8_t byte;
+    return hw_uart_read(&byte, 1) == 1 ? byte : -1;
 }
 
 size_t hw_uart_read(uint8_t *buf, size_t maxlen) {
-    if (maxlen == 0) return 0;
-    uint32_t wp = get_rx_write_pos();
-    size_t n = dma_ring_read(rx_buffer, &rx_read_pos, wp, RX_MASK, buf, maxlen);
+    if (rx_dma_chan < 0) return 0;
+    size_t n = dma_rx_read(&rx_state, rx_dma_chan, rx_buffer, buf, maxlen);
     total_rx_bytes += n;
     return n;
 }
 
+bool hw_uart_rx_take_loss(void) {
+    bool lost = rx_reported_loss_epoch != rx_state.loss_epoch;
+    rx_reported_loss_epoch = rx_state.loss_epoch;
+    return lost;
+}
+
+void hw_uart_get_rx_loss_stats(uint64_t *discarded_bytes, uint32_t *ambiguous_polls) {
+    if (discarded_bytes) *discarded_bytes = rx_state.discarded_bytes;
+    if (ambiguous_polls) *ambiguous_polls = rx_state.ambiguous_polls;
+}
+
 bool hw_uart_tx_ready(void) {
-    return !tx_busy;
+    return tx_dma_chan < 0 || !dma_channel_is_busy(tx_dma_chan);
 }
 
 void hw_uart_tx_wait(void) {
-    while (tx_busy) {
+    while (!hw_uart_tx_ready()) {
         tight_loop_contents();
     }
 }
@@ -277,5 +243,5 @@ void hw_uart_tx_wait(void) {
 void hw_uart_get_stats(uint32_t *tx_bytes, uint32_t *rx_bytes, uint32_t *overflows) {
     if (tx_bytes) *tx_bytes = total_tx_bytes;
     if (rx_bytes) *rx_bytes = total_rx_bytes;
-    if (overflows) *overflows = rx_overflows;
+    if (overflows) *overflows = rx_state.overruns;
 }

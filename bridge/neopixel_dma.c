@@ -187,7 +187,7 @@ void neopixel_dma_init(PIO pio, uint pin) {
         channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
         channel_config_set_read_increment(&c, false);
         channel_config_set_write_increment(&c, false);
-        channel_config_set_dreq(&c, DREQ_FORCE);
+        channel_config_set_dreq(&c, pio_get_dreq(s_pio, s_sm, true));
 
         dma_channel_configure(
             s_dma_chan,

@@ -95,6 +95,9 @@ typedef struct {
 
 // Initialize the kmbox commands module
 void kmbox_commands_init(void);
+// NULL restores stdout output for hosted tools. Firmware supplies its UART queue.
+typedef bool (*kmbox_output_callback_t)(const char *data, size_t len);
+void kmbox_set_output_callback(kmbox_output_callback_t callback);
 
 // Process incoming serial data (call this with each received character)
 void kmbox_process_serial_char(char c, uint32_t current_time_ms);
@@ -172,6 +175,8 @@ const char* kmbox_get_button_name(kmbox_button_t button);
 
 // Update physical button states (call this with actual hardware button states)
 void kmbox_update_physical_buttons(uint8_t physical_buttons);
+// Absolute synthetic button mask; releasing it preserves physical holds.
+void kmbox_set_injected_buttons(uint8_t buttons);
 
 // Monitor mode control (polling-based button state queries)
 void kmbox_set_monitor_enabled(bool enabled);
